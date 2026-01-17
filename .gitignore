@@ -3,9 +3,6 @@ node_modules/
 npm-debug.log*
 .npm
 
-# Distribution
-dist/
-
 # AIRON config
 .airon/
 config.json

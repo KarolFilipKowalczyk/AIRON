@@ -115,7 +115,8 @@ namespace AIRON.MCP
         {
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
             
-            GUILayout.Label("Editor MCP Server (Port 3002)", EditorStyles.boldLabel);
+            int currentPort = EditorPrefs.GetInt("AIRON_EditorMCP_Port", 3002);
+            GUILayout.Label($"Editor MCP Server (Port {currentPort})", EditorStyles.boldLabel);
             GUILayout.Space(5);
             
             bool isRunning = EditorMCPServer.IsRunning();
@@ -130,6 +131,26 @@ namespace AIRON.MCP
             GUI.color = oldColor;
             
             EditorGUILayout.EndHorizontal();
+            
+            GUILayout.Space(10);
+            
+            // Port configuration
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.Label("Port:", GUILayout.Width(80));
+            int newPort = EditorGUILayout.IntField(currentPort, GUILayout.Width(80));
+            EditorGUILayout.EndHorizontal();
+            
+            if (newPort != currentPort && newPort >= 1024 && newPort <= 65535)
+            {
+                EditorPrefs.SetInt("AIRON_EditorMCP_Port", newPort);
+                
+                // Restart server if running
+                if (isRunning)
+                {
+                    EditorMCPServer.Stop();
+                    EditorMCPServer.Start();
+                }
+            }
             
             GUILayout.Space(10);
             
@@ -281,7 +302,8 @@ namespace AIRON.MCP
         {
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
             
-            GUILayout.Label("Game MCP Server (Port 3003)", EditorStyles.boldLabel);
+            int currentPort = EditorPrefs.GetInt("AIRON_GameMCP_Port", 3003);
+            GUILayout.Label($"Game MCP Server (Port {currentPort})", EditorStyles.boldLabel);
             GUILayout.Space(5);
             
             bool isInPlayMode = EditorApplication.isPlaying;
@@ -319,6 +341,28 @@ namespace AIRON.MCP
             GUI.color = oldColor;
             
             EditorGUILayout.EndHorizontal();
+            
+            GUILayout.Space(10);
+            
+            // Port configuration
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.Label("Port:", GUILayout.Width(80));
+            int newPort = EditorGUILayout.IntField(currentPort, GUILayout.Width(80));
+            EditorGUILayout.EndHorizontal();
+            
+            if (newPort != currentPort && newPort >= 1024 && newPort <= 65535)
+            {
+                EditorPrefs.SetInt("AIRON_GameMCP_Port", newPort);
+                
+                // Note: Server will use new port on next Play Mode entry
+                if (isInPlayMode && gameServerExists)
+                {
+                    EditorGUILayout.HelpBox(
+                        "Port will change on next Play Mode entry. Exit and re-enter Play Mode to apply.",
+                        MessageType.Info
+                    );
+                }
+            }
             
             GUILayout.Space(10);
             

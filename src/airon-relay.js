@@ -21,6 +21,43 @@ const wss = new WebSocketServer({ server });
 
 app.use(express.json());
 
+// Simple rate limiting implementation - prevent brute force attacks
+const rateLimitMap = new Map(); // IP -> { count, resetTime }
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_MAX = 100; // Max requests per window
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const record = rateLimitMap.get(ip);
+  
+  if (!record || now > record.resetTime) {
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    return true;
+  }
+  
+  if (record.count >= RATE_LIMIT_MAX) {
+    return false;
+  }
+  
+  record.count++;
+  return true;
+}
+
+// Clean up old rate limit entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of rateLimitMap.entries()) {
+    if (now > record.resetTime) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}, 60000); // Clean up every minute
+
+// Connection limits - prevent resource exhaustion
+const MAX_CONNECTIONS_PER_IP = 10;
+const MAX_TOTAL_SSE_CLIENTS = 1000;
+const MAX_PENDING_REQUESTS = 10000;
+
 // User management - maintain list of authorized nodes
 const DATA_DIR = process.env.AIRON_DATA_DIR || '.';
 const NODES_FILE = `${DATA_DIR}/airon-nodes.json`;
@@ -60,17 +97,54 @@ function saveAuthorizedNodes(nodesData) {
   }
 }
 
+// Timing-safe token comparison to prevent timing attacks
+function timingSafeTokenCheck(token, authorizedList) {
+  // Check if token exists in list using timing-safe comparison
+  for (const authorizedToken of authorizedList) {
+    if (authorizedToken.length !== token.length) {
+      continue; // Skip length mismatch (constant time)
+    }
+    
+    try {
+      const tokenBuf = Buffer.from(token, 'utf8');
+      const authBuf = Buffer.from(authorizedToken, 'utf8');
+      
+      if (crypto.timingSafeEqual(tokenBuf, authBuf)) {
+        return true;
+      }
+    } catch {
+      // Length mismatch or encoding error, continue
+      continue;
+    }
+  }
+  return false;
+}
+
 let authorizedNodes = loadAuthorizedNodes();
 
 // In-memory state
 const nodes = new Map();           // token -> WebSocket
 const sseClients = new Map();      // sessionId -> { res, token }
 const pendingRequests = new Map(); // requestId -> { resolve, reject }
+const connectionsPerIP = new Map(); // IP -> count
 
 // MCP Endpoint with username and secret in path
 app.get('/mcp/:username/:secret', (req, res) => {
   const { username, secret } = req.params;
   const token = `${username}:${secret}`;
+  
+  // Check rate limit
+  const clientIp = req.ip || req.connection.remoteAddress;
+  if (!checkRateLimit(clientIp)) {
+    console.log(`✗ Rate limit exceeded for IP: ${clientIp}`);
+    return res.status(429).send('Too many authentication attempts, please try again later.');
+  }
+  
+  // Check connection limits
+  if (sseClients.size >= MAX_TOTAL_SSE_CLIENTS) {
+    console.log(`✗ Connection rejected: max SSE clients reached (${MAX_TOTAL_SSE_CLIENTS})`);
+    return res.status(503).send('Server at capacity. Please try again later.');
+  }
   
   // Require airon-nodes.json to exist (no auto-initialization)
   if (authorizedNodes === null) {
@@ -78,17 +152,16 @@ app.get('/mcp/:username/:secret', (req, res) => {
     return res.status(403).send('Access denied. Server not initialized. Contact administrator.');
   }
   
-  // Check if this node token is authorized
-  if (!authorizedNodes.nodes.includes(token) && !authorizedNodes.admins.includes(token)) {
+  // Check if this node token is authorized using timing-safe comparison
+  const allAuthorizedTokens = [...authorizedNodes.nodes, ...authorizedNodes.admins];
+  if (!timingSafeTokenCheck(token, allAuthorizedTokens)) {
     console.log(`✗ Node rejected [${username}]: not authorized`);
     return res.status(403).send('Access denied. Contact administrator for access.');
   }
   
-  // Check if node is connected with this token
-  const node = nodes.get(token);
-  if (!node || node.readyState !== 1) {
-    return res.status(403).send('Node not connected. Start your node first with: airon <token>');
-  }
+  // Note: We don't check if node is connected here - allow MCP connection
+  // to establish even if node is offline. Tool calls will return appropriate
+  // "node offline" messages instead of breaking the entire connection.
   
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -184,18 +257,31 @@ function getTools(isAdmin = false) {
     },
     { 
       name: 'claude-continue', 
-      description: 'Force execution of a Claude Code session with --dangerously-skip-permissions.\n\n**⚠️ IMPORTANT: This command RE-RUNS the task with full permissions**\nWhen you call claude-continue, the original task is executed again with `--dangerously-skip-permissions`, which means:\n- File operations will be performed\n- Commands will be executed\n- No additional approval is required\n\n**Workflow:**\n1. claude-code runs in safe mode (analyzes and explains what it wants to do)\n2. User reviews the explanation\n3. claude-continue forces execution with full permissions\n\n**Session Management:**\n- If sessionId provided: Force execute that specific session\n- If sessionId omitted: Force execute the most recent session\n- Check status tool to see active_sessions list\n\n**Example:**\n1. claude-code: "create a file test.txt"\n2. Response: "I need permission to create the file..."\n3. claude-continue: input="approved"\n4. Response: "✓ Created test.txt" (file actually created with --dangerously-skip-permissions)', 
+      description: 'Continue an interactive Claude Code session by providing input or resuming after a timeout.\n\n**Use cases:**\n- Provide additional context or corrections to Claude Code\n- Resume a session that paused waiting for input\n- Multi-turn conversation with Claude Code\n\n**Session Management:**\n- If sessionId provided: Continue that specific session\n- If sessionId omitted: Continue the most recent session\n- Check status tool to see active_sessions list\n\n**Example:**\n1. claude-code: "analyze the codebase"\n2. Response: "Which directory should I focus on?"\n3. claude-continue: input="Focus on the Scripts folder"\n4. Response: Claude continues with that guidance', 
+      inputSchema: { 
+        type: 'object', 
+        properties: { 
+          sessionId: { 
+            type: 'string', 
+            description: 'Session ID to continue. If omitted, continues the most recent session.'
+          }, 
+          input: { 
+            type: 'string', 
+            description: 'User input to provide to Claude Code.'
+          } 
+        } 
+      } 
+    },
+    { 
+      name: 'claude-force', 
+      description: 'Force execution of a Claude Code session with --dangerously-skip-permissions.\n\n**⚠️ IMPORTANT: This command RE-RUNS the task with full permissions**\nWhen you call claude-force, the original task is executed again with `--dangerously-skip-permissions`, which means:\n- File operations will be performed\n- Commands will be executed\n- No additional approval is required\n\n**Workflow:**\n1. claude-code runs in safe mode (analyzes and explains what it wants to do)\n2. User reviews the explanation\n3. claude-force approves and executes with full permissions\n\n**Session Management:**\n- If sessionId provided: Force execute that specific session\n- If sessionId omitted: Force execute the most recent session\n- Check status tool to see active_sessions list\n\n**Example:**\n1. claude-code: "create a file test.txt"\n2. Response: "I need permission to create the file..."\n3. claude-force\n4. Response: "✓ Created test.txt" (file actually created with --dangerously-skip-permissions)', 
       inputSchema: { 
         type: 'object', 
         properties: { 
           sessionId: { 
             type: 'string', 
             description: 'Session ID to force execute. If omitted, executes the most recent session.'
-          }, 
-          input: { 
-            type: 'string', 
-            description: 'Optional user input (typically "approved"). The task will be force-executed regardless of input value.'
-          } 
+          }
         } 
       } 
     },
@@ -343,18 +429,36 @@ ${authorizedNodes.admins.map(n => `• ${n}${n === currentNodeId ? ' [YOU]' : ''
 }
 
 function formatOfflineMessage() {
-  return `⚠️ AIRON Node Offline
-
-Your node is not connected.
-
-Run: airon <your-token>`;
+  return `⚠️ AIRON Node Offline - Ask user to run: airon https://dev.airon.games/mcp`;
 }
 
 function forwardToNode(ws, request, timeout = 120000) {
   return new Promise((resolve, reject) => {
+    // Check pending request limits
+    if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
+      return reject(new Error('Too many pending requests'));
+    }
+    
     const id = request.id || crypto.randomUUID();
-    const timer = setTimeout(() => { pendingRequests.delete(id); reject(new Error('Timeout')); }, timeout);
-    pendingRequests.set(id, { resolve: (r) => { clearTimeout(timer); resolve(r); }, reject });
+    const timer = setTimeout(() => { 
+      pendingRequests.delete(id); 
+      reject(new Error('Timeout')); 
+    }, timeout);
+    
+    pendingRequests.set(id, { 
+      resolve: (r) => { 
+        clearTimeout(timer); 
+        pendingRequests.delete(id);
+        resolve(r); 
+      }, 
+      reject: (e) => {
+        clearTimeout(timer);
+        pendingRequests.delete(id);
+        reject(e);
+      },
+      ws // Store WebSocket reference for cleanup
+    });
+    
     ws.send(JSON.stringify({ ...request, id }));
   });
 }
@@ -389,12 +493,22 @@ wss.on('connection', (ws, req) => {
         pendingRequests.delete(msg.id);
         resolve(msg.result);
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error(`WebSocket message parse error: ${e.message}`);
+    }
   });
   
   ws.on('close', () => { 
     console.log(`✗ Node disconnected [${username}]`);
-    nodes.delete(token); 
+    nodes.delete(token);
+    
+    // Clean up all pending requests for this WebSocket
+    for (const [id, pending] of pendingRequests.entries()) {
+      if (pending.ws === ws) {
+        pending.reject(new Error('WebSocket disconnected'));
+        pendingRequests.delete(id);
+      }
+    }
   });
   
   ws.on('pong', () => { ws.isAlive = true; });

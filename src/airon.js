@@ -6,7 +6,7 @@
  * Licensed under the MIT License
  * See: https://opensource.org/licenses/MIT
  * 
- * Usage: airon <relay-url> [-user <username>] [-secret <secret>]
+ * Usage: airon <relay-url> [-u|--user <username>] [-s|--secret <secret>] [-e|--editor-port <port>] [-g|--game-port <port>]
  */
 
 import WebSocket from 'ws';
@@ -171,12 +171,30 @@ function parseArgs() {
   const args = process.argv.slice(2);
   const parsed = { relay: args[0] }; // First unnamed arg is relay
   
+  // Map of short args to long args
+  const argAliases = {
+    'u': 'user',
+    's': 'secret',
+    'e': 'editor-port',
+    'g': 'game-port'
+  };
+  
   for (let i = 1; i < args.length; i++) {
-    if (args[i].startsWith('-')) {
-      const key = args[i].substring(1);
+    if (args[i].startsWith('--')) {
+      // Long argument (e.g., --port)
+      const key = args[i].substring(2);
       const value = args[i + 1];
       if (value && !value.startsWith('-')) {
         parsed[key] = value;
+        i++; // Skip next arg since we consumed it
+      }
+    } else if (args[i].startsWith('-')) {
+      // Short argument (e.g., -p)
+      const shortKey = args[i].substring(1);
+      const longKey = argAliases[shortKey] || shortKey;
+      const value = args[i + 1];
+      if (value && !value.startsWith('-')) {
+        parsed[longKey] = value;
         i++; // Skip next arg since we consumed it
       }
     }
@@ -237,8 +255,10 @@ const args = parseArgs();
 // Validate relay URL
 if (!args.relay) {
   console.error('\n  ❌ Error: Missing relay URL\n');
-  console.error('  Usage: airon <relay-url> [-user <username>] [-secret <secret>]\n');
-  console.error('  Example: airon https://relay.example.com/mcp -user myusername -secret my-secret-token-here\n');
+  console.error('  Usage: airon <relay-url> [-u|--user <username>] [-s|--secret <secret>] [-e|--editor-port <port>] [-g|--game-port <port>]\n');
+  console.error('  Example: airon https://relay.example.com/mcp -u myusername -s my-secret-token-here\n');
+  console.error('  Or: airon https://relay.example.com/mcp --user myusername --secret my-secret-token-here\n');
+  console.error('  Or: airon https://relay.example.com/mcp -u myusername -s token -e 3002 -g 3003\n');
   console.error('  Or: airon https://relay.example.com/mcp (will prompt for user/secret)\n');
   process.exit(1);
 }
@@ -266,6 +286,8 @@ let RELAY_URL;
 let token;
 let MCP_URL;
 let UNITY_SECRET;
+let UNITY_EDITOR_PORT;
+let UNITY_GAME_PORT;
 
 // Main async function to handle prompts and connection
 async function main() {
@@ -292,9 +314,13 @@ RELAY_URL = args.relay.replace(/^https?:\/\//, 'wss://').replace(/\/mcp$/, ''); 
 token = `${args.user}:${args.secret}`;
 MCP_URL = `${args.relay}/${args.user}/${args.secret}`;
 UNITY_SECRET = args.secret; // Use same secret for Unity MCP
+UNITY_EDITOR_PORT = parseInt(args['editor-port']) || 3002; // Default to 3002
+UNITY_GAME_PORT = parseInt(args['game-port']) || 3003; // Default to 3003
 
 console.log(`\n  🔗 Connecting to: ${RELAY_URL}`);
-console.log(`  👤 User: ${args.user}\n`);
+console.log(`  👤 User: ${args.user}`);
+console.log(`  🎮 Unity Editor Port: ${UNITY_EDITOR_PORT}`);
+console.log(`  🎮 Unity Game Port: ${UNITY_GAME_PORT}\n`);
 
 // Check and setup Claude Code settings
 function checkClaudeSettings() {
@@ -464,12 +490,12 @@ function checkPort(port) {
 }
 
 async function checkUnityEditorMCP() {
-  if (!checkPort(3002)) {
+  if (!checkPort(UNITY_EDITOR_PORT)) {
     return 'not running';
   }
   
   try {
-    const response = await fetch('http://localhost:3002/mcp', {
+    const response = await fetch(`http://localhost:${UNITY_EDITOR_PORT}/mcp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -492,16 +518,16 @@ async function checkUnityEditorMCP() {
     }
   } catch {}
   
-  return 'running (port 3002)';
+  return `running (port ${UNITY_EDITOR_PORT})`;
 }
 
 async function checkUnityGameMCP() {
-  if (!checkPort(3003)) {
+  if (!checkPort(UNITY_GAME_PORT)) {
     return 'not running';
   }
   
   try {
-    const response = await fetch('http://localhost:3003/mcp', {
+    const response = await fetch(`http://localhost:${UNITY_GAME_PORT}/mcp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -524,7 +550,7 @@ async function checkUnityGameMCP() {
     }
   } catch {}
   
-  return 'running (port 3003)';
+  return `running (port ${UNITY_GAME_PORT})`;
 }
 
 async function getStatus() {
@@ -607,7 +633,46 @@ function continueClaudeSession(sessionId, userInput) {
       return;
     }
     
-    console.log(`\n  ▶️  Forcing execution of session ${sessionId}`);
+    console.log(`\n  ▶️  Continuing session ${sessionId}`);
+    if (userInput) {
+      console.log(`  💬 Input: ${userInput}\n`);
+    }
+    
+    taskCompletionResolve = resolve;
+    
+    // Get original description from session
+    const originalDescription = session.description || 'Continue session';
+    
+    currentTask = {
+      description: `Continue: ${originalDescription}`,
+      started: new Date().toISOString(),
+      status: 'running',
+      sessionId: sessionId,
+      interactive: true
+    };
+
+    // Continue in interactive mode (no --dangerously-skip-permissions)
+    const args = ['-p', originalDescription];
+    
+    currentProcess = spawnClaudeCode(args, sessionId, {
+      cleanupAfter: false,
+      successMessage: 'Session continued'
+    });
+    
+    session.process = currentProcess;
+    session.status = 'running';
+  });
+}
+
+function forceClaudeSession(sessionId) {
+  return new Promise((resolve) => {
+    const session = activeSessions.get(sessionId);
+    if (!session) {
+      resolve(`❌ Session ${sessionId} not found. Available sessions: ${Array.from(activeSessions.keys()).join(', ')}`);
+      return;
+    }
+    
+    console.log(`\n  ⚡ Forcing execution of session ${sessionId}`);
     console.log(`  ⚠️  Running with --dangerously-skip-permissions\n`);
     
     taskCompletionResolve = resolve;
@@ -628,7 +693,7 @@ function continueClaudeSession(sessionId, userInput) {
     
     currentProcess = spawnClaudeCode(args, sessionId, {
       cleanupAfter: false,
-      successMessage: 'Session step completed'
+      successMessage: 'Forced execution completed'
     });
     
     session.process = currentProcess;
@@ -657,19 +722,35 @@ async function handleClaudeCode(args) {
 async function handleClaudeContinue(args) {
   // If sessionId provided, continue that specific session
   if (args?.sessionId) {
-    const userInput = args.input || 'continue';
+    const userInput = args?.input || '';
     const result = await continueClaudeSession(args.sessionId, userInput);
     return result;
   }
   
   // If currentSessionId exists, continue most recent interactive session
   if (currentSessionId && activeSessions.has(currentSessionId)) {
-    const userInput = args.input || 'continue';
+    const userInput = args?.input || '';
     const result = await continueClaudeSession(currentSessionId, userInput);
     return result;
   }
   
   return '❌ No active session to continue. Use claude-sessions to see available sessions.';
+}
+
+async function handleClaudeForce(args) {
+  // If sessionId provided, force that specific session
+  if (args?.sessionId) {
+    const result = await forceClaudeSession(args.sessionId);
+    return result;
+  }
+  
+  // If currentSessionId exists, force most recent session
+  if (currentSessionId && activeSessions.has(currentSessionId)) {
+    const result = await forceClaudeSession(currentSessionId);
+    return result;
+  }
+  
+  return '❌ No active session to force execute. Use claude-sessions to see available sessions.';
 }
 
 async function handleClaudeSessions() {
@@ -882,6 +963,7 @@ async function handleToolCall(name, args) {
     'status': handleStatus,
     'claude-code': handleClaudeCode,
     'claude-continue': handleClaudeContinue,
+    'claude-force': handleClaudeForce,
     'claude-sessions': handleClaudeSessions,
     'claude-abort': handleClaudeAbort,
     'str_replace': handleStrReplace,
@@ -925,177 +1007,6 @@ async function handleToolCall(name, args) {
   // unity-tools - List all Unity MCP tools
   if (name === 'unity-tools') {
     return await listUnityToolsFormatted();
-  }
-  
-  // view - View file contents or directory listing
-  if (name === 'view') {
-    try {
-      const { readFileSync, readdirSync, statSync, existsSync } = await import('fs');
-      const { join } = await import('path');
-      
-      if (!args?.path) {
-        return '❌ Error: path is required';
-      }
-      
-      const absolutePath = validatePath(args.path);
-      
-      if (!existsSync(absolutePath)) {
-        return `❌ Error: ${args.path} does not exist`;
-      }
-      
-      const stats = statSync(absolutePath);
-      
-      // Directory listing
-      if (stats.isDirectory()) {
-        const entries = readdirSync(absolutePath, { withFileTypes: true });
-        const listing = entries.map(entry => {
-          const type = entry.isDirectory() ? '[DIR]' : '[FILE]';
-          return `${type} ${entry.name}`;
-        }).join('\n');
-        return listing || '(empty directory)';
-      }
-      
-      // File contents
-      const content = readFileSync(absolutePath, 'utf-8');
-      
-      // Handle line range if specified
-      if (args?.lines && Array.isArray(args.lines) && args.lines.length === 2) {
-        const [start, end] = args.lines;
-        const lines = content.split('\n');
-        const selectedLines = lines.slice(start - 1, end === -1 ? undefined : end);
-        return selectedLines.map((line, idx) => `${start + idx}: ${line}`).join('\n');
-      }
-      
-      // Return full file with line numbers
-      const lines = content.split('\n');
-      return lines.map((line, idx) => `${idx + 1}: ${line}`).join('\n');
-      
-    } catch (err) {
-      return `❌ Error: ${err.message}`;
-    }
-  }
-  
-  // grep - Search for pattern in files
-  if (name === 'grep') {
-    try {
-      const { readFileSync, readdirSync, statSync, existsSync } = await import('fs');
-      const { join } = await import('path');
-      
-      if (!args?.pattern || !args?.path) {
-        return '❌ Error: pattern and path are required';
-      }
-      
-      const absolutePath = validatePath(args.path);
-      
-      if (!existsSync(absolutePath)) {
-        return `❌ Error: ${args.path} does not exist`;
-      }
-      
-      const stats = statSync(absolutePath);
-      const results = [];
-      
-      // Validate regex pattern to prevent ReDoS
-      let regex;
-      try {
-        regex = new RegExp(args.pattern, args.ignoreCase ? 'gi' : 'g');
-        // Test regex with a timeout by testing against empty string
-        const testStart = Date.now();
-        regex.test('');
-        if (Date.now() - testStart > 100) {
-          return '❌ Error: Invalid regex pattern (too complex)';
-        }
-      } catch (err) {
-        return `❌ Error: Invalid regex pattern: ${err.message}`;
-      }
-      
-      // Search in a single file
-      function searchFile(filePath, relativePath) {
-        try {
-          const content = readFileSync(filePath, 'utf-8');
-          const lines = content.split('\n');
-          
-          lines.forEach((line, index) => {
-            // Timeout protection per line
-            const lineTestStart = Date.now();
-            try {
-              if (regex.test(line) && Date.now() - lineTestStart < 100) {
-                results.push(`${relativePath}:${index + 1}: ${line.trim()}`);
-              }
-            } catch (err) {
-              // Skip problematic lines
-            }
-          });
-        } catch (err) {
-          // Skip files that can't be read
-        }
-      }
-      
-      // Recursively search directory
-      function searchDirectory(dirPath, basePath) {
-        const entries = readdirSync(dirPath, { withFileTypes: true });
-        
-        for (const entry of entries) {
-          const fullPath = join(dirPath, entry.name);
-          const relativePath = join(basePath, entry.name);
-          
-          // Skip common ignore patterns
-          if (entry.name.startsWith('.') || 
-              entry.name === 'node_modules' || 
-              entry.name === 'Library' ||
-              entry.name === 'Temp') {
-            continue;
-          }
-          
-          if (entry.isDirectory() && args.recursive) {
-            searchDirectory(fullPath, relativePath);
-          } else if (entry.isFile()) {
-            // Filter by file extension if specified
-            if (args.filePattern) {
-              try {
-                const extRegex = new RegExp(args.filePattern);
-                // Test with timeout protection
-                const testStart = Date.now();
-                extRegex.test('');
-                if (Date.now() - testStart > 100) {
-                  continue; // Skip this file if pattern is too complex
-                }
-                if (!extRegex.test(entry.name)) {
-                  continue;
-                }
-              } catch {
-                continue; // Skip if pattern is invalid
-              }
-            }
-            searchFile(fullPath, relativePath);
-          }
-        }
-      }
-      
-      // Start search
-      if (stats.isDirectory()) {
-        if (!args.recursive) {
-          return '❌ Error: path is a directory. Use recursive=true to search directories';
-        }
-        searchDirectory(absolutePath, args.path);
-      } else {
-        searchFile(absolutePath, args.path);
-      }
-      
-      if (results.length === 0) {
-        return `No matches found for pattern: ${args.pattern}`;
-      }
-      
-      // Limit results to avoid overwhelming output
-      const maxResults = args.maxResults || 100;
-      if (results.length > maxResults) {
-        return results.slice(0, maxResults).join('\n') + 
-               `\n... (${results.length - maxResults} more matches, increase maxResults to see more)`;
-      }
-      
-      return results.join('\n');
-    } catch (err) {
-      return `❌ Error: ${err.message}`;
-    }
   }
   
   // Unknown tool
@@ -1207,7 +1118,7 @@ function connect(token) {
 
 // Helper to call Unity MCP servers directly
 async function callUnityMCP(server, tool, args) {
-  const port = server === 'editor' ? 3002 : 3003;
+  const port = server === 'editor' ? UNITY_EDITOR_PORT : UNITY_GAME_PORT;
   const url = `http://localhost:${port}/mcp`;
   
   try {
@@ -1270,8 +1181,8 @@ async function callUnityMCP(server, tool, args) {
 // List all available Unity MCP tools
 async function listUnityTools() {
   const servers = [
-    { name: 'Unity Editor', port: 3002 },
-    { name: 'Unity Game', port: 3003 }
+    { name: 'Unity Editor', port: UNITY_EDITOR_PORT },
+    { name: 'Unity Game', port: UNITY_GAME_PORT }
   ];
   
   for (const { name, port } of servers) {
@@ -1325,7 +1236,7 @@ async function listUnityTools() {
 
 // Helper function to call Unity MCP and return formatted result
 async function callUnityMCPForTool(server, tool, args) {
-  const port = server === 'editor' ? 3002 : 3003;
+  const port = server === 'editor' ? UNITY_EDITOR_PORT : UNITY_GAME_PORT;
   const url = `http://localhost:${port}/mcp`;
   
   try {
@@ -1384,8 +1295,8 @@ async function callUnityMCPForTool(server, tool, args) {
 // Helper function to list Unity tools and return as formatted string
 async function listUnityToolsFormatted() {
   const servers = [
-    { name: 'Unity Editor', port: 3002 },
-    { name: 'Unity Game', port: 3003 }
+    { name: 'Unity Editor', port: UNITY_EDITOR_PORT },
+    { name: 'Unity Game', port: UNITY_GAME_PORT }
   ];
   
   let output = '';
@@ -1473,8 +1384,9 @@ function startInteractiveCLI() {
         console.log('  ─────────────────────────────────────────');
         console.log('  status                     - Check Unity and MCP server status');
         console.log('  claude-sessions            - List active Claude Code sessions');
-        console.log('  claude-code <description>  - Run Claude Code task (interactive by default)');
-        console.log('  claude-continue [input]    - Continue most recent session with optional input');
+        console.log('  claude-code <description>  - Run Claude Code task (interactive mode)');
+        console.log('  claude-continue [input]    - Continue session with input/after timeout');
+        console.log('  claude-force               - Approve and force execute with full permissions');
         console.log('  claude-abort               - Abort current running Claude Code task');
         console.log('  unity-editor <tool> [args] - Call Unity Editor MCP tool');
         console.log('  unity-game <tool> [args]   - Call Unity Game MCP tool');
@@ -1483,8 +1395,9 @@ function startInteractiveCLI() {
         console.log('  exit                       - Exit AIRON');
         console.log('');
         console.log('  Examples:');
-        console.log('  claude-code enter Unity play mode');
-        console.log('  claude-continue approved');
+        console.log('  claude-code create a player controller');
+        console.log('  claude-continue Focus on WASD movement');
+        console.log('  claude-force');
         console.log('  unity-editor play');
         console.log('  unity-editor viewlog lines=[1,100]');
         console.log('  unity-game execute script="return 2+2"');
@@ -1531,11 +1444,25 @@ function startInteractiveCLI() {
 
       case 'claude-continue':
         if (currentSessionId && activeSessions.has(currentSessionId)) {
-          const input = args || 'continue';
-          console.log(`\n  ▶️  Continuing session with: ${input}`);
+          const input = args || '';
+          if (input) {
+            console.log(`\n  ▶️  Continuing session with input: ${input}`);
+          } else {
+            console.log(`\n  ▶️  Continuing session...`);
+          }
           await continueClaudeSession(currentSessionId, input);
         } else {
           console.log('\n  ⚠️  No active session to continue');
+        }
+        break;
+
+      case 'claude-force':
+      case 'force': // Support short name
+        if (currentSessionId && activeSessions.has(currentSessionId)) {
+          console.log(`\n  ⚡ Forcing execution of session...`);
+          await forceClaudeSession(currentSessionId);
+        } else {
+          console.log('\n  ⚠️  No active session to force execute');
         }
         break;
 

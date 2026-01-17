@@ -14,7 +14,8 @@ namespace AIRON.MCP
 {
     public class GameMCPServer : MonoBehaviour
     {
-        private const int Port = 3003;
+        private const int DefaultPort = 3003;
+        private int _port;
         private HttpListener _listener;
         private Thread _thread;
         private bool _running;
@@ -124,6 +125,13 @@ namespace AIRON.MCP
         {
             try
             {
+                // Load port configuration (default to 3003)
+                #if UNITY_EDITOR
+                _port = UnityEditor.EditorPrefs.GetInt("AIRON_GameMCP_Port", DefaultPort);
+                #else
+                _port = DefaultPort;
+                #endif
+                
                 // Start capturing logs
                 Application.logMessageReceived += HandleLog;
                 
@@ -136,14 +144,14 @@ namespace AIRON.MCP
                 _serverStartTime = DateTime.UtcNow;
                 
                 _listener = new HttpListener();
-                _listener.Prefixes.Add($"http://localhost:{Port}/");
+                _listener.Prefixes.Add($"http://localhost:{_port}/");
                 _listener.Start();
                 _running = true;
 
                 _thread = new Thread(ListenLoop) { IsBackground = true };
                 _thread.Start();
 
-                Debug.Log($"[AIRON] Game MCP server started on port {Port}");
+                Debug.Log($"[AIRON] Game MCP server started on port {_port}");
             }
             catch (Exception e)
             {
@@ -174,6 +182,16 @@ namespace AIRON.MCP
             _listener?.Close();
             _thread?.Join(1000);
             Debug.Log("[AIRON] Game MCP server stopped");
+        }
+        
+        public int GetPort()
+        {
+            return _port;
+        }
+        
+        public bool IsRunning()
+        {
+            return _running;
         }
 
         private void Update()
@@ -211,9 +229,7 @@ namespace AIRON.MCP
             var request = context.Request;
             var response = context.Response;
 
-            response.Headers.Add("Access-Control-Allow-Origin", "*");
-            response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            response.Headers.Add("Access-Control-Allow-Headers", "Content-Type, Authorization");
+            // No CORS headers - restrict to localhost only for security
 
             if (request.HttpMethod == "OPTIONS")
             {

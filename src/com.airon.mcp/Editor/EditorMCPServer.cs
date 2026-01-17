@@ -17,7 +17,8 @@ namespace AIRON.MCP
     [InitializeOnLoad]
     public static class EditorMCPServer
     {
-        private const int Port = 3002;
+        private const int DefaultPort = 3002;
+        private static int _port;
         private static HttpListener _listener;
         private static Thread _thread;
         private static bool _running;
@@ -36,6 +37,9 @@ namespace AIRON.MCP
 
         static EditorMCPServer()
         {
+            // Load port configuration (default to 3002)
+            _port = EditorPrefs.GetInt("AIRON_EditorMCP_Port", DefaultPort);
+            
             // Load custom tools on main thread and cache them
             LoadCustomToolsCache();
             
@@ -60,6 +64,9 @@ namespace AIRON.MCP
         {
             if (_running) return;
             
+            // Reload port configuration
+            _port = EditorPrefs.GetInt("AIRON_EditorMCP_Port", DefaultPort);
+            
             // Cache secret if set (EditorPrefs only accessible from main thread)
             _cachedSecret = EditorPrefs.GetString("AIRON_EditorMCP_Secret", "");
 
@@ -69,14 +76,14 @@ namespace AIRON.MCP
                 LoadCustomToolsCache();
                 
                 _listener = new HttpListener();
-                _listener.Prefixes.Add($"http://localhost:{Port}/");
+                _listener.Prefixes.Add($"http://localhost:{_port}/");
                 _listener.Start();
                 _running = true;
 
                 _thread = new Thread(ListenLoop) { IsBackground = true };
                 _thread.Start();
 
-                Debug.Log($"[AIRON] Editor MCP server started on port {Port}");
+                Debug.Log($"[AIRON] Editor MCP server started on port {_port}");
             }
             catch (Exception e)
             {
@@ -159,6 +166,11 @@ namespace AIRON.MCP
         {
             return _running;
         }
+        
+        public static int GetPort()
+        {
+            return _port;
+        }
 
         private static void ListenLoop()
         {
@@ -185,11 +197,8 @@ namespace AIRON.MCP
             var request = context.Request;
             var response = context.Response;
 
-            // CORS headers
-            response.Headers.Add("Access-Control-Allow-Origin", "*");
-            response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            response.Headers.Add("Access-Control-Allow-Headers", "Content-Type, Authorization");
-
+            // No CORS headers - restrict to localhost only for security
+            
             if (request.HttpMethod == "OPTIONS")
             {
                 response.StatusCode = 200;

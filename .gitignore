@@ -1,0 +1,29 @@
+# Node
+node_modules/
+npm-debug.log*
+.npm
+
+# Distribution
+dist/
+
+# AIRON config
+.airon/
+config.json
+airon-nodes.json
+data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

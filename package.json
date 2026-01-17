@@ -1,0 +1,45 @@
+{
+  "name": "airon",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Artificial Intelligence Remote Operations Node - Control Unity remotely via Claude.ai MCP",
+  "main": "src/airon.js",
+  "bin": {
+    "airon": "src/airon.js"
+  },
+  "scripts": {
+    "start": "node src/airon.js",
+    "relay": "node src/airon-relay.js",
+    "bundle": "esbuild src/airon.js --bundle --platform=node --format=cjs --outfile=dist/airon-bundled.cjs",
+    "build": "npm run bundle && node build-sea.js"
+  },
+  "keywords": [
+    "unity",
+    "mcp",
+    "claude",
+    "ai",
+    "remote",
+    "development",
+    "automation"
+  ],
+  "author": "Karol Kowalczyk",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KarolFilipKowalczyk/AIRON.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KarolFilipKowalczyk/AIRON/issues"
+  },
+  "homepage": "https://github.com/KarolFilipKowalczyk/AIRON#readme",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.0.0",
+    "express": "^4.18.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.17.0"
+  }
+}

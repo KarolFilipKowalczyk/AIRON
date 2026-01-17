@@ -1,0 +1,10 @@
+{
+  "name": "AironMCP.Editor",
+  "rootNamespace": "Airon.MCP",
+  "references": [],
+  "includePlatforms": ["Editor"],
+  "excludePlatforms": [],
+  "overrideReferences": true,
+  "precompiledReferences": ["Newtonsoft.Json.dll"],
+  "autoReferenced": true
+}

@@ -1,0 +1,10 @@
+{
+  "name": "AironMCP.Runtime",
+  "rootNamespace": "Airon.MCP",
+  "references": [],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "overrideReferences": true,
+  "precompiledReferences": ["Newtonsoft.Json.dll"],
+  "autoReferenced": true
+}

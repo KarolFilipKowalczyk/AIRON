@@ -2,7 +2,7 @@
 
 **AI Remote Operations Node for Unity Editor**
 
-Control Unity Editor and Game runtime remotely through Model Context Protocol (MCP) servers, enabling AI-driven development workflows with Claude.ai and other AI assistants.
+Control Unity Editor and Game runtime remotely through Model Context Protocol (MCP) servers, enabling AI-driven development workflows with Claude Code and other AI assistants.
 
 ## Overview
 
@@ -11,34 +11,127 @@ The AIRON Unity MCP package provides two MCP servers that expose Unity functiona
 - **Editor MCP Server** (port 3002) - Controls Unity Editor (Play/Stop, compilation, logs, custom tools)
 - **Game MCP Server** (port 3003) - Controls game runtime during Play Mode (scene management, logs, custom tools)
 
+Both servers use **Streamable HTTP transport** (MCP spec 2025-03-26) with a single `/mcp` endpoint supporting:
+- **POST** - JSON-RPC requests
+- **GET** - SSE stream for server-to-client notifications
+- **DELETE** - Session termination
+
 Both servers support **custom tools** via reflection, allowing you to expose any static C# method as an MCP tool.
+
+**Security Note:** Both servers bind to localhost only and do not accept remote connections. This is by design for security.
 
 ## Installation
 
 1. Copy `Packages/com.airon.mcp/` to your Unity project's Packages folder
 2. Unity will automatically import the package
-3. Open the AIRON Control window: **Window → AIRON Control**
+3. Open the AIRON Control window: **Window -> AIRON Control**
+
+## Claude Code Integration
+
+### Adding MCP Servers to Claude Code
+
+Use the `claude mcp add` command to connect Claude Code to Unity:
+
+**Editor MCP Server (always available):**
+```bash
+claude mcp add unity-editor --transport http http://localhost:3002/mcp
+```
+
+**Game MCP Server (Play Mode only):**
+```bash
+claude mcp add unity-game --transport http http://localhost:3003/mcp
+```
+
+### Using MCP Tools in Claude Code
+
+Once connected, Claude Code can use the Unity MCP tools:
+
+```
+# Check Unity Editor status
+mcp__unity-editor__status
+
+# Enter Play Mode
+mcp__unity-editor__play
+
+# View Unity console logs
+mcp__unity-editor__viewlog
+
+# Call custom tools (example)
+mcp__unity-editor__AIRON_MCP_Examples_ListScenes
+```
+
+### Managing MCP Connections
+
+```bash
+# List all configured MCP servers
+claude mcp list
+
+# Remove an MCP server
+claude mcp remove unity-editor
+```
+
+## Configuration File
+
+AIRON MCP uses a file-based configuration system stored in `ProjectSettings/AironMcpConfig.json`. This allows you to:
+- **Version control** your MCP tool configurations
+- **Share configurations** across your team
+- **Edit directly** or use the GUI in AIRON Control window
+
+### Configuration Format
+
+```json
+{
+  "editorTools": [
+    {
+      "toolName": "AIRON.MCP.Examples.ListScenes",
+      "description": "List all scenes in the project"
+    }
+  ],
+  "gameTools": [
+    {
+      "toolName": "AIRON.MCP.RuntimeExamples.GetLoadedScenes",
+      "description": "Get all loaded scenes"
+    }
+  ],
+  "editorPort": 3002,
+  "gamePort": 3003,
+  "editorAutoStart": true,
+  "gameAutoStart": true
+}
+```
+
+### Manual Configuration
+
+You can edit the configuration file directly or use these menu items:
+- **Window -> AIRON Control -> Open Window** - GUI configuration editor
+- **Window -> AIRON Control -> Open Config File** - Open configuration file location
+- **Window -> AIRON Control -> Reset to Defaults** - Delete config and restore defaults
 
 ## Quick Start
 
-### 1. Configure Authentication (Optional)
+### 1. Start Unity and Open AIRON Control
 
-The MCP servers can run with or without authentication:
+1. Open your Unity project
+2. Go to **Window -> AIRON Control -> Open Window**
+3. The Editor MCP server starts automatically by default
 
-- **Without auth**: Leave secret field empty (suitable for localhost-only access)
-- **With auth**: Set a 16+ character secret in the AIRON Control window
+### 2. Connect Claude Code
 
-### 2. Start MCP Servers
+```bash
+# Add Editor MCP server
+claude mcp add unity-editor --transport http http://localhost:3002/mcp
 
-In the AIRON Control window:
-- Enable **Auto-start on Play** (recommended)
-- Or click **Start Server** manually
+# Add Game MCP server (optional, for Play Mode control)
+claude mcp add unity-game --transport http http://localhost:3003/mcp
+```
 
-The Editor MCP server runs continuously. The Game MCP server only runs during Play Mode.
+### 3. Verify Connection
 
-### 3. Connect from Claude.ai
-
-Use the AIRON node client (`airon.js`) to connect your local Unity to Claude.ai's MCP connector system. See the main AIRON documentation for setup instructions.
+In Claude Code, test the connection:
+```
+# Should return Unity Editor status
+mcp__unity-editor__status
+```
 
 ## Editor MCP Server (Port 3002)
 
@@ -48,7 +141,7 @@ Use the AIRON node client (`airon.js`) to connect your local Unity to Claude.ai'
 |------|-------------|-----------|
 | `play` | Enter Play Mode | None |
 | `stop` | Exit Play Mode | None |
-| `pause` | Pause/unpause Play Mode | None |
+| `pause` | Toggle pause in Play Mode | None |
 | `status` | Get Editor state (playing, paused, compiling) | None |
 | `viewlog` | View Unity console logs with filtering | `lines: [start, end]` (optional, default: last 50 lines), `filter: "all"|"error"|"warning"|"info"` (optional) |
 
@@ -131,11 +224,12 @@ namespace MyGame
 
 ## Security
 
-### Authentication
+### Localhost Only
 
-- Optional secret token authentication (16+ characters recommended)
-- Secrets cached in EditorPrefs (Editor: `AIRON_EditorMCP_Secret`, Game: `AIRON_GameMCP_Secret`)
-- If no secret configured, servers accept all connections (localhost-only recommended)
+Both MCP servers bind exclusively to `localhost` (127.0.0.1) and do not accept connections from remote machines. This ensures:
+- Only local applications can connect to the MCP servers
+- No network exposure of Unity Editor controls
+- Safe for development environments
 
 ### Custom Tools Validation
 
@@ -143,13 +237,17 @@ namespace MyGame
 - Only explicitly configured methods can be invoked
 - Prevents arbitrary code execution via reflection
 
-### Network Exposure
-
-- Both servers bind to `localhost` (127.0.0.1) only
-- Not accessible from network by default
-- Use AIRON relay server for remote access
-
 ## Architecture Notes
+
+### Transport Protocol
+
+Both servers use **Streamable HTTP** transport (MCP spec 2025-03-26):
+- Single `/mcp` endpoint for all operations
+- **POST**: JSON-RPC requests (single or batch)
+- **GET**: Opens SSE stream for server-to-client notifications (requires `Accept: text/event-stream` header)
+- **DELETE**: Terminates session (requires `Mcp-Session-Id` header)
+- Session management via `Mcp-Session-Id` header
+- Protocol version: `2024-11-05`
 
 ### Threading Model
 
@@ -161,13 +259,24 @@ namespace MyGame
 Unity's domain reload during compilation:
 - Disconnects MCP server connections
 - Changes instance IDs
-- AIRON node client automatically reconnects and handles this
+- Claude Code and AIRON node client automatically reconnect
 
 ### Play Mode Transitions
 
 - Game MCP server starts automatically when entering Play Mode
 - Stops automatically when exiting Play Mode
 - Editor MCP continues running throughout
+
+### SSE Notifications
+
+Both servers support Server-Sent Events (SSE) for real-time notifications:
+```csharp
+// Broadcast custom event from your code
+ServerEditor.BroadcastEvent("myEvent", new { data = "value" });
+
+// Broadcast MCP notification
+ServerEditor.BroadcastNotification("tools/updated", null);
+```
 
 ## Troubleshooting
 
@@ -177,18 +286,22 @@ Unity's domain reload during compilation:
 - Verify port 3002/3003 aren't already in use
 - Try restarting Unity
 
+### Claude Code Connection Issues
+
+- Verify the MCP server is running (check AIRON Control window)
+- Ensure the URL is correct: `http://localhost:3002/mcp` (not just `/`)
+- Try removing and re-adding the MCP server:
+  ```bash
+  claude mcp remove unity-editor
+  claude mcp add unity-editor --transport http http://localhost:3002/mcp
+  ```
+
 ### Custom Tool Not Found
 
 - Verify the full path is correct: `Namespace.ClassName.MethodName`
 - Method must be `public static`
 - Method must return `string`
 - Restart MCP server after adding tools
-
-### Authentication Failures
-
-- Verify secret matches on both client and server
-- Secret must be 16+ characters if used
-- Check Unity console logs for auth errors
 
 ### Compilation Issues
 
@@ -227,7 +340,7 @@ public static string MyTool()
     Debug.Log("This appears in Unity console");
     Debug.LogWarning("Warning message");
     Debug.LogError("Error message");
-    
+
     return "Tool result";
 }
 ```
@@ -295,21 +408,36 @@ public static class EditorAutomation
 #endif
 ```
 
-## Integration with AIRON System
+## Integration Options
 
-This Unity package is part of the larger AIRON system:
+### Option 1: Claude Code Direct Connection (Recommended)
+
+Connect Claude Code directly to the MCP servers running on your machine:
+
+```bash
+claude mcp add unity-editor --transport http http://localhost:3002/mcp
+claude mcp add unity-game --transport http http://localhost:3003/mcp
+```
+
+This is the simplest setup for local development workflows.
+
+### Option 2: AIRON Remote System (For Remote/Mobile Access)
+
+This Unity package is part of the larger AIRON system for remote access:
 
 - **airon-relay.js** - MCP relay server hosted at dev.airon.games
 - **airon.js** - Node client connecting local Unity to Claude.ai
 - **com.airon.mcp** - This Unity package (MCP servers)
 
-See the main AIRON documentation for complete system setup.
+See the main AIRON documentation for complete remote system setup.
 
 ## Version
 
-**Version**: 0.1.0-alpha  
-**Unity Version**: 2021.3+  
-**License**: MIT
+- **Version**: 0.2.0-alpha
+- **Unity Version**: 2021.3+
+- **MCP Protocol**: 2024-11-05
+- **Transport**: Streamable HTTP (MCP spec 2025-03-26)
+- **License**: MIT
 
 ## Support
 
@@ -317,4 +445,4 @@ For issues, questions, or contributions, see the main AIRON repository.
 
 ---
 
-**Built for AI-driven game development. Control Unity remotely, develop collaboratively with AI. 🚀**
+**Built for AI-driven game development. Control Unity remotely with Claude Code.**

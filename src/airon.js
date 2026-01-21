@@ -6,7 +6,7 @@
  * Licensed under the MIT License
  * See: https://opensource.org/licenses/MIT
  * 
- * Usage: airon <relay-url> [-u|--user <username>] [-s|--secret <secret>] [-e|--editor-port <port>] [-g|--game-port <port>]
+ * Usage: airon <relay-url> [-u|--user <username>] [-s|--secret <secret>] [-e|--editor-port <port>] [-g|--game-port <port>] [-p|--path <working-dir>]
  */
 
 import WebSocket from 'ws';
@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from
 import { randomUUID } from 'crypto';
 import readline from 'readline';
 
-const WORKING_DIR = process.cwd(); // Where airon.js was launched
+let WORKING_DIR = process.cwd(); // Default: where airon.js was launched, can be overridden by -p/--path
 
 // Global state variables - must be declared before functions that use them
 let currentTask = null;
@@ -28,6 +28,8 @@ let currentProcess = null;
 let outputBuffer = '';
 let taskCompletionResolve = null;
 let readlineInterface = null; // Store readline interface globally
+let currentWs = null; // Store WebSocket connection for admin commands
+let adminCheckInProgress = false; // Flag to suppress error messages during admin check
 
 function validatePath(requestedPath) {
   // Block UNC paths and absolute paths
@@ -176,7 +178,8 @@ function parseArgs() {
     'u': 'user',
     's': 'secret',
     'e': 'editor-port',
-    'g': 'game-port'
+    'g': 'game-port',
+    'p': 'path'
   };
   
   for (let i = 1; i < args.length; i++) {
@@ -252,13 +255,54 @@ async function prompt(question, hidden = false) {
 
 const args = parseArgs();
 
+// Handle --help flag
+if (args.help || args.h) {
+  console.log('\n  AIRON Node Client - Remote Unity Development via Claude.ai\n');
+  console.log('  Usage: airon <relay-url> [options]\n');
+  console.log('  Options:');
+  console.log('    -u, --user <username>      Username for authentication');
+  console.log('    -s, --secret <secret>      Secret token (min 16 chars)');
+  console.log('    -e, --editor-port <port>   Unity Editor MCP port (default: 3002)');
+  console.log('    -g, --game-port <port>     Unity Game MCP port (default: 3003)');
+  console.log('    -p, --path <directory>     Working directory (default: current)');
+  console.log('    -h, --help                 Show this help message\n');
+  console.log('  Examples:');
+  console.log('    airon https://dev.airon.games/mcp');
+  console.log('    airon https://relay.example.com/mcp -u myuser -s my-secret-token');
+  console.log('    airon https://relay.example.com/mcp -u myuser -s token -p ~/MyProject');
+  console.log('    airon https://relay.example.com/mcp -u myuser -s token -e 4002 -g 4003\n');
+  process.exit(0);
+}
+
+// Handle working directory override
+if (args.path) {
+  const requestedPath = resolve(args.path);
+  if (!existsSync(requestedPath)) {
+    console.error(`\n  ❌ Error: Path does not exist: ${requestedPath}\n`);
+    process.exit(1);
+  }
+  try {
+    const stats = require('fs').statSync(requestedPath);
+    if (!stats.isDirectory()) {
+      console.error(`\n  ❌ Error: Path is not a directory: ${requestedPath}\n`);
+      process.exit(1);
+    }
+  } catch (err) {
+    console.error(`\n  ❌ Error: Cannot access path: ${err.message}\n`);
+    process.exit(1);
+  }
+  WORKING_DIR = requestedPath;
+  console.log(`\n  📁 Working directory: ${WORKING_DIR}\n`);
+}
+
 // Validate relay URL
 if (!args.relay) {
   console.error('\n  ❌ Error: Missing relay URL\n');
-  console.error('  Usage: airon <relay-url> [-u|--user <username>] [-s|--secret <secret>] [-e|--editor-port <port>] [-g|--game-port <port>]\n');
+  console.error('  Usage: airon <relay-url> [-u|--user <username>] [-s|--secret <secret>] [-e|--editor-port <port>] [-g|--game-port <port>] [-p|--path <working-dir>]\n');
   console.error('  Example: airon https://relay.example.com/mcp -u myusername -s my-secret-token-here\n');
   console.error('  Or: airon https://relay.example.com/mcp --user myusername --secret my-secret-token-here\n');
   console.error('  Or: airon https://relay.example.com/mcp -u myusername -s token -e 3002 -g 3003\n');
+  console.error('  Or: airon https://relay.example.com/mcp -u myuser -s token -p /path/to/project\n');
   console.error('  Or: airon https://relay.example.com/mcp (will prompt for user/secret)\n');
   process.exit(1);
 }
@@ -288,6 +332,7 @@ let MCP_URL;
 let UNITY_SECRET;
 let UNITY_EDITOR_PORT;
 let UNITY_GAME_PORT;
+let isAdminNode = false; // Will be set after connecting and checking status
 
 // Main async function to handle prompts and connection
 async function main() {
@@ -344,6 +389,14 @@ function checkClaudeSettings() {
   if (!existsSync(settingsPath)) {
     console.log('  📝 Creating settings.json with MCP permissions...');
     const defaultSettings = {
+      mcpServers: {
+        "unity-editor": {
+          url: `http://localhost:${UNITY_EDITOR_PORT}/mcp`
+        },
+        "unity-game": {
+          url: `http://localhost:${UNITY_GAME_PORT}/mcp`
+        }
+      },
       permissions: {
         allow: [
           // Unity MCP Servers
@@ -351,16 +404,16 @@ function checkClaudeSettings() {
           "mcp__unity-game__*",
           
           // Claude Code File Operations (restricted to working directory)
-          "read_file__**",
-          "write_file__**",
-          "edit_file__**",
-          "create_file__**",
-          "list_directory__**"
+          "Read_file__**",
+          "Write_file__**",
+          "Edit_file__**",
+          "Create_file__**",
+          "List_directory__**"
         ],
         deny: [
           // Deny execution commands for safety
-          "execute__*",
-          "run_terminal_command__*"
+          "Execute__*",
+          "Run_terminal_command__*"
         ]
       }
     };
@@ -379,9 +432,17 @@ function checkClaudeSettings() {
       
       if (!settings.permissions || !settings.permissions.allow || settings.permissions.allow.length === 0) {
         console.log('  ⚠️  settings.json exists but has no permissions configured');
-        console.log('  📝 Please add permissions manually to ~/.claude/settings.json:');
+        console.log('  📝 Please add to ~/.claude/settings.json:');
         console.log('');
         console.log('  {');
+        console.log('    "mcpServers": {');
+        console.log('      "unity-editor": {');
+        console.log(`        "url": "http://localhost:${UNITY_EDITOR_PORT}/mcp"`);
+        console.log('      },');
+        console.log('      "unity-game": {');
+        console.log(`        "url": "http://localhost:${UNITY_GAME_PORT}/mcp"`);
+        console.log('      }');
+        console.log('    },');
         console.log('    "permissions": {');
         console.log('      "allow": [');
         console.log('        // Unity MCP Servers');
@@ -389,16 +450,16 @@ function checkClaudeSettings() {
         console.log('        "mcp__unity-game__*",');
         console.log('        ');
         console.log('        // Claude Code File Operations (working directory only)');
-        console.log('        "read_file__**",');
-        console.log('        "write_file__**",');
-        console.log('        "edit_file__**",');
-        console.log('        "create_file__**",');
-        console.log('        "list_directory__**"');
+        console.log('        "Read_file__**",');
+        console.log('        "Write_file__**",');
+        console.log('        "Edit_file__**",');
+        console.log('        "Create_file__**",');
+        console.log('        "List_directory__**"');
         console.log('      ],');
         console.log('      "deny": [');
         console.log('        // Deny execution for safety');
-        console.log('        "execute__*",');
-        console.log('        "run_terminal_command__*"');
+        console.log('        "Execute__*",');
+        console.log('        "Run_terminal_command__*"');
         console.log('      ]');
         console.log('    }');
         console.log('  }');
@@ -410,12 +471,23 @@ function checkClaudeSettings() {
         const hasUnityEditor = settings.permissions.allow.some(p => p.includes('unity-editor'));
         const hasUnityGame = settings.permissions.allow.some(p => p.includes('unity-game'));
         
+        // Check if MCP servers are configured
+        const hasEditorServer = settings.mcpServers && settings.mcpServers['unity-editor'];
+        const hasGameServer = settings.mcpServers && settings.mcpServers['unity-game'];
+        
         if (hasUnityEditor && hasUnityGame) {
           console.log('  ✅ Unity MCP permissions are configured');
         } else {
           console.log('  ⚠️  Unity MCP permissions may be incomplete');
           if (!hasUnityEditor) console.log('     Missing: mcp__unity-editor__*');
           if (!hasUnityGame) console.log('     Missing: mcp__unity-game__*');
+        }
+        
+        if (hasEditorServer && hasGameServer) {
+          console.log('  ✅ Unity MCP servers are configured');
+        } else {
+          console.log('  ⚠️  Unity MCP servers not configured in settings.json');
+          console.log(`     Add "mcpServers" section with unity-editor (port ${UNITY_EDITOR_PORT}) and unity-game (port ${UNITY_GAME_PORT})`);
         }
       }
     } catch (err) {
@@ -1013,6 +1085,113 @@ async function handleToolCall(name, args) {
   return `⚠️ Unknown tool: ${name}`;
 }
 
+// Send admin command over WebSocket
+async function checkAdminStatus() {
+  return new Promise((resolve) => {
+    if (!currentWs || currentWs.readyState !== 1) {
+      resolve(false);
+      return;
+    }
+    
+    adminCheckInProgress = true; // Suppress error logging
+    
+    const id = crypto.randomUUID();
+    const adminRequest = {
+      type: 'admin',
+      id: id,
+      args: { subcommand: 'user-list' }
+    };
+    
+    let timeoutHandle = null;
+    
+    const originalOnMessage = currentWs.onmessage;
+    const messageHandler = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'admin_response' && msg.id === id) {
+          clearTimeout(timeoutHandle);
+          currentWs.onmessage = originalOnMessage;
+          adminCheckInProgress = false; // Re-enable error logging
+          // If no error, we have admin access
+          resolve(!msg.error);
+        }
+      } catch (e) {
+        if (originalOnMessage) {
+          originalOnMessage(event);
+        }
+      }
+    };
+    
+    currentWs.onmessage = messageHandler;
+    currentWs.send(JSON.stringify(adminRequest));
+    
+    timeoutHandle = setTimeout(() => {
+      currentWs.onmessage = originalOnMessage;
+      adminCheckInProgress = false; // Re-enable error logging
+      resolve(false);
+    }, 2000);
+  });
+}
+
+function sendAdminCommand(subcommand, nodeId, makeAdmin) {
+  return new Promise((resolve) => {
+    if (!currentWs || currentWs.readyState !== 1) {
+      console.log('\n  ❌ Not connected to relay');
+      resolve();
+      return;
+    }
+    
+    const id = crypto.randomUUID();
+    const adminRequest = {
+      type: 'admin',
+      id: id,
+      args: {
+        subcommand: subcommand,
+        nodeId: nodeId,
+        isAdmin: makeAdmin
+      }
+    };
+    
+    console.log(`\n  👑 Admin: ${subcommand}${nodeId ? ` ${nodeId}` : ''}${makeAdmin ? ' (admin)' : ''}`);
+    
+    let timeoutHandle = null;
+    
+    // Set up response handler
+    const originalOnMessage = currentWs.onmessage;
+    const messageHandler = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'admin_response' && msg.id === id) {
+          clearTimeout(timeoutHandle); // Clear timeout on response
+          if (msg.error) {
+            console.log(`\n  ❌ ${msg.error}\n`);
+          } else {
+            console.log(`\n${msg.result}\n`);
+          }
+          // Restore original handler
+          currentWs.onmessage = originalOnMessage;
+          resolve();
+        }
+      } catch (e) {
+        // Not for us, let original handler deal with it
+        if (originalOnMessage) {
+          originalOnMessage(event);
+        }
+      }
+    };
+    
+    currentWs.onmessage = messageHandler;
+    currentWs.send(JSON.stringify(adminRequest));
+    
+    // Timeout after 5 seconds
+    timeoutHandle = setTimeout(() => {
+      currentWs.onmessage = originalOnMessage;
+      console.log('\n  ⏱️  Admin command timeout\n');
+      resolve();
+    }, 5000);
+  });
+}
+
 function connect(token) {
   const ws = new WebSocket(RELAY_URL, {
     headers: {
@@ -1020,9 +1199,17 @@ function connect(token) {
     }
   });
 
-  ws.on('open', () => {
+  currentWs = ws; // Store globally for admin commands
+
+  ws.on('open', async () => {
     console.log('  ✓ Connected to relay. Waiting for tasks...\n');
     console.log('  ' + '─'.repeat(50) + '\n');
+    
+    // Check admin status
+    isAdminNode = await checkAdminStatus();
+    if (isAdminNode) {
+      console.log('  👑 Admin privileges detected\n');
+    }
     
     // Start interactive CLI after successful connection
     startInteractiveCLI();
@@ -1032,10 +1219,10 @@ function connect(token) {
     try {
       const msg = JSON.parse(data);
       
-      // Handle error messages from relay
-      if (msg.error) {
+      // Handle error messages from relay (but not during admin check)
+      if (msg.error && !adminCheckInProgress) {
         console.error('\n  ❌ ERROR FROM RELAY:');
-        console.error('     ' + msg.message);
+        console.error('     ' + (msg.error || msg.message || 'Unknown error'));
         return;
       }
       
@@ -1100,6 +1287,7 @@ function connect(token) {
   });
 
   ws.on('close', (code, reason) => {
+    currentWs = null; // Clear global reference
     const reasonText = reason?.toString() || '';
     if (code === 1008) {
       console.log('\n  ❌ AUTHENTICATION FAILED: ' + reasonText);
@@ -1391,6 +1579,9 @@ function startInteractiveCLI() {
         console.log('  unity-editor <tool> [args] - Call Unity Editor MCP tool');
         console.log('  unity-game <tool> [args]   - Call Unity Game MCP tool');
         console.log('  unity-tools                - List all available Unity MCP tools');
+        if (isAdminNode) {
+          console.log('  admin <subcommand>         - Admin commands (user-list, user-add, user-delete)');
+        }
         console.log('  help                       - Show this help');
         console.log('  exit                       - Exit AIRON');
         console.log('');
@@ -1401,7 +1592,67 @@ function startInteractiveCLI() {
         console.log('  unity-editor play');
         console.log('  unity-editor viewlog lines=[1,100]');
         console.log('  unity-game execute script="return 2+2"');
+        if (isAdminNode) {
+          console.log('  admin user-list');
+          console.log('  admin user-add <username> <secret>');
+          console.log('  admin user-add <username> <secret> --admin');
+          console.log('  admin user-delete <username> <secret>');
+          console.log('');
+          console.log('  Note: MCP URL format is https://dev.airon.games/mcp/<username>/<secret>');
+        }
         console.log('');
+        break;
+
+      case 'admin':
+        if (!isAdminNode) {
+          console.log('\n  ❌ Admin access required\n');
+          break;
+        }
+        if (!args) {
+          console.log('\n  ❌ Usage: admin <subcommand> [arguments]');
+          console.log('  Subcommands:');
+          console.log('    user-list                         - List all nodes and their status');
+          console.log('    user-add <username> <secret>      - Add a new node');
+          console.log('    user-add <username> <secret> --admin - Add a new admin node');
+          console.log('    user-delete <username> <secret>   - Remove a node');
+          console.log('');
+          console.log('  Examples:');
+          console.log('    admin user-add alice AbCdEfGh1234567890');
+          console.log('    admin user-add bob XyZaBcDeFg1234567890 --admin');
+          console.log('    admin user-delete charlie PqRsTuVwXyZ1234567890');
+          console.log('');
+          console.log('  MCP connector URL format:');
+          console.log('    https://dev.airon.games/mcp/<username>/<secret>');
+          console.log('');
+        } else {
+          const adminParts = args.split(' ');
+          const subcommand = adminParts[0];
+          const username = adminParts[1];
+          const secret = adminParts[2];
+          const makeAdmin = adminParts.includes('--admin');
+          
+          // Build nodeId from username and secret
+          let nodeId;
+          if (subcommand === 'user-add') {
+            if (!username || !secret) {
+              console.log('\n  ❌ Usage: admin user-add <username> <secret> [--admin]');
+              console.log('  Example: admin user-add alice AbCdEfGh1234567890\n');
+              break;
+            }
+            nodeId = `${username}:${secret}`;
+          } else if (subcommand === 'user-delete') {
+            if (!username || !secret) {
+              console.log('\n  ❌ Usage: admin user-delete <username> <secret>');
+              console.log('  Example: admin user-delete bob XyZaBcDeFg1234567890\n');
+              break;
+            }
+            nodeId = `${username}:${secret}`;
+          } else {
+            nodeId = username; // For other commands if any
+          }
+          
+          await sendAdminCommand(subcommand, nodeId, makeAdmin);
+        }
         break;
 
       case 'status':

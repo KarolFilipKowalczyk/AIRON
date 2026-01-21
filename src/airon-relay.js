@@ -13,7 +13,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import crypto from 'crypto';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFile, writeFile, access } from 'fs/promises';
 
 const app = express();
 const server = createServer(app);
@@ -57,42 +57,47 @@ setInterval(() => {
 const MAX_CONNECTIONS_PER_IP = 10;
 const MAX_TOTAL_SSE_CLIENTS = 1000;
 const MAX_PENDING_REQUESTS = 10000;
+const SSE_IDLE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+const FORWARD_TIMEOUT = 30000; // 30 seconds
 
 // User management - maintain list of authorized nodes
 const DATA_DIR = process.env.AIRON_DATA_DIR || '.';
 const NODES_FILE = `${DATA_DIR}/airon-nodes.json`;
 const INITIAL_ADMIN = process.env.AIRON_ADMIN_NODE; // Set initial admin via env var
 
-function loadAuthorizedNodes() {
-  if (!existsSync(NODES_FILE)) {
-    // If INITIAL_ADMIN is set, create file with that admin
+async function loadAuthorizedNodes() {
+  try {
+    await access(NODES_FILE);
+  } catch {
+    // File doesn't exist
     if (INITIAL_ADMIN) {
       const nodesData = {
         nodes: [INITIAL_ADMIN],
         admins: [INITIAL_ADMIN]
       };
-      saveAuthorizedNodes(nodesData);
+      await saveAuthorizedNodes(nodesData);
       console.log(`✓ Initialized with admin node from AIRON_ADMIN_NODE`);
       return nodesData;
     }
-    // Otherwise, no file exists yet - will be created when first node connects
     return null;
   }
   
   try {
-    return JSON.parse(readFileSync(NODES_FILE, 'utf-8'));
+    const data = await readFile(NODES_FILE, 'utf-8');
+    return JSON.parse(data);
   } catch (err) {
     console.error('Failed to load nodes file:', err.message);
     return { nodes: [], admins: [] };
   }
 }
 
-function saveAuthorizedNodes(nodesData) {
+async function saveAuthorizedNodes(nodesData) {
   try {
-    writeFileSync(NODES_FILE, JSON.stringify(nodesData, null, 2));
+    const jsonData = JSON.stringify(nodesData, null, 2);
+    await writeFile(NODES_FILE, jsonData, 'utf-8');
     return true;
   } catch (err) {
-    console.error('Failed to save nodes file:', err.message);
+    console.error(`Failed to save nodes file to ${NODES_FILE}:`, err.message);
     return false;
   }
 }
@@ -120,44 +125,47 @@ function timingSafeTokenCheck(token, authorizedList) {
   return false;
 }
 
-let authorizedNodes = loadAuthorizedNodes();
+let authorizedNodes = null;
 
 // In-memory state
 const nodes = new Map();           // token -> WebSocket
-const sseClients = new Map();      // sessionId -> { res, token }
+const sseClients = new Map();      // sessionId -> { res, token, lastActivity, idleTimer }
 const pendingRequests = new Map(); // requestId -> { resolve, reject }
-const connectionsPerIP = new Map(); // IP -> count
 
 // MCP Endpoint with username and secret in path
 app.get('/mcp/:username/:secret', (req, res) => {
   const { username, secret } = req.params;
   const token = `${username}:${secret}`;
   
+  console.log(`📥 MCP connection attempt: ${username} from ${req.ip}`);
+  
   // Check rate limit
   const clientIp = req.ip || req.connection.remoteAddress;
   if (!checkRateLimit(clientIp)) {
-    console.log(`✗ Rate limit exceeded for IP: ${clientIp}`);
+    console.log(`✗ Rate limit exceeded: ${username} from ${clientIp}`);
     return res.status(429).send('Too many authentication attempts, please try again later.');
   }
   
   // Check connection limits
   if (sseClients.size >= MAX_TOTAL_SSE_CLIENTS) {
-    console.log(`✗ Connection rejected: max SSE clients reached (${MAX_TOTAL_SSE_CLIENTS})`);
+    console.log(`✗ Connection rejected (capacity): ${username}`);
     return res.status(503).send('Server at capacity. Please try again later.');
   }
   
   // Require airon-nodes.json to exist (no auto-initialization)
   if (authorizedNodes === null) {
-    console.log(`✗ Node rejected: no airon-nodes.json file (set AIRON_ADMIN_NODE)`);
+    console.log(`✗ Connection rejected (not initialized): ${username}`);
     return res.status(403).send('Access denied. Server not initialized. Contact administrator.');
   }
   
   // Check if this node token is authorized using timing-safe comparison
   const allAuthorizedTokens = [...authorizedNodes.nodes, ...authorizedNodes.admins];
   if (!timingSafeTokenCheck(token, allAuthorizedTokens)) {
-    console.log(`✗ Node rejected [${username}]: not authorized`);
+    console.log(`✗ Auth failed: ${username} (not authorized)`);
     return res.status(403).send('Access denied. Contact administrator for access.');
   }
+  
+  console.log(`✓ Auth success: ${username}`);
   
   // Note: We don't check if node is connected here - allow MCP connection
   // to establish even if node is offline. Tool calls will return appropriate
@@ -169,14 +177,27 @@ app.get('/mcp/:username/:secret', (req, res) => {
   res.flushHeaders();
 
   const sessionId = crypto.randomUUID();
-  sseClients.set(sessionId, { res, token, username });
+  
+  // Setup idle timeout
+  const idleTimer = setTimeout(() => {
+    console.log(`✗ SSE session idle timeout: ${username} (${sessionId.substring(0, 8)}...)`);
+    sseClients.delete(sessionId);
+    res.end();
+  }, SSE_IDLE_TIMEOUT);
+  
+  sseClients.set(sessionId, { res, token, username, lastActivity: Date.now(), idleTimer });
+  
+  console.log(`✓ SSE session created: ${username} (${sessionId.substring(0, 8)}...)`);
 
   const messageEndpoint = `https://dev.airon.games/mcp/${username}/${secret}?sessionId=${sessionId}`;
   res.write('event: endpoint\n');
   res.write('data: ' + messageEndpoint + '\n\n');
 
   req.on('close', () => {
+    const session = sseClients.get(sessionId);
+    if (session?.idleTimer) clearTimeout(session.idleTimer);
     sseClients.delete(sessionId);
+    console.log(`✗ SSE session closed: ${username} (${sessionId.substring(0, 8)}...)`);
   });
 });
 
@@ -188,7 +209,19 @@ app.post('/mcp/:username/:secret', async (req, res) => {
   const session = sseClients.get(sessionId);
   
   if (!session) {
+    console.log(`✗ Invalid session: ${username} (session not found)`);
     return res.status(400).json({ error: 'invalid session' });
+  }
+  
+  // Reset idle timer on activity
+  if (session.idleTimer) {
+    clearTimeout(session.idleTimer);
+    session.idleTimer = setTimeout(() => {
+      console.log(`✗ SSE session idle timeout: ${session.username} (${sessionId.substring(0, 8)}...)`);
+      sseClients.delete(sessionId);
+      session.res.end();
+    }, SSE_IDLE_TIMEOUT);
+    session.lastActivity = Date.now();
   }
 
   const { method, params, id } = req.body;
@@ -207,26 +240,16 @@ app.post('/mcp/:username/:secret', async (req, res) => {
   } else if (method === 'tools/call') {
     const { name: toolName } = params;
     
-    // Handle admin tools locally on relay
-    if (toolName === 'admin') {
-      const isAdmin = authorizedNodes && authorizedNodes.admins.includes(session.token);
-      if (!isAdmin) {
-        result = { content: [{ type: 'text', text: '❌ Admin access required' }] };
-      } else {
-        result = await handleAdminTool(params.arguments, session.token);
-      }
+    // Forward all tool calls to node
+    const node = nodes.get(session.token);
+    
+    if (!node || node.readyState !== 1) {
+      result = { content: [{ type: 'text', text: formatOfflineMessage() }] };
     } else {
-      // Forward to node
-      const node = nodes.get(session.token);
-      
-      if (!node || node.readyState !== 1) {
-        result = { content: [{ type: 'text', text: formatOfflineMessage() }] };
-      } else {
-        try {
-          result = await forwardToNode(node, { method, params, id });
-        } catch (err) {
-          result = { content: [{ type: 'text', text: '⚠️ Error: ' + err.message }] };
-        }
+      try {
+        result = await forwardToNode(node, { method, params, id });
+      } catch (err) {
+        result = { content: [{ type: 'text', text: '⚠️ Error: ' + err.message }] };
       }
     }
   } else {
@@ -287,7 +310,7 @@ function getTools(isAdmin = false) {
     },
     { 
       name: 'status', 
-      description: 'Get comprehensive status of the remote development node including:\n- Node connectivity (online/offline)\n- Claude Code availability\n- Unity Editor status (running/not running)\n- Unity Game status (running/not running)\n- Unity Editor MCP server status (with launch timestamp)\n- Unity Game MCP server status (available during Play Mode)\n- Current task information (if any Claude Code task is running)\n- Active sessions list (all interactive Claude Code sessions with their IDs and status)\n\nUse this to check what Claude Code sessions are available for claude-continue, verify Unity is running, or troubleshoot connectivity issues.', 
+      description: 'READ-ONLY: Get comprehensive status of the remote development node. Does not modify files, run code, or control Unity.\n\nReturns information about:\n- Node connectivity (online/offline)\n- Claude Code availability\n- Unity Editor status (running/not running)\n- Unity Game status (running/not running)\n- Unity Editor MCP server status (with launch timestamp)\n- Unity Game MCP server status (available during Play Mode)\n- Current task information (if any Claude Code task is running)\n- Active sessions list (all interactive Claude Code sessions with their IDs and status)\n\nUse this to check what Claude Code sessions are available for claude-continue, verify Unity is running, or troubleshoot connectivity issues.', 
       inputSchema: { 
         type: 'object', 
         properties: {} 
@@ -303,14 +326,14 @@ function getTools(isAdmin = false) {
     },
     { 
       name: 'claude-sessions', 
-      description: 'List all active Claude Code sessions on the remote node. Shows session IDs, status (running/completed/failed), and timestamps. Use this to:\n- See what interactive sessions are available for claude-continue\n- Check the status of sessions\n- Find session IDs to resume specific sessions\n- Monitor session lifecycle\n\nEach session includes:\n- sessionId: Unique identifier for the session\n- status: Current state (running, completed, failed, aborted)\n- started: When the session was created\n- finished: When the session completed (if applicable)\n\nSessions are automatically cleaned up 5 minutes after completion.', 
+      description: 'READ-ONLY: List all active Claude Code sessions on the remote node. Does not modify files, run code, or control Unity.\n\nShows session IDs, status (running/completed/failed), and timestamps. Use this to:\n- See what interactive sessions are available for claude-continue\n- Check the status of sessions\n- Find session IDs to resume specific sessions\n- Monitor session lifecycle\n\nEach session includes:\n- sessionId: Unique identifier for the session\n- status: Current state (running, completed, failed, aborted)\n- started: When the session was created\n- finished: When the session completed (if applicable)\n\nSessions are automatically cleaned up 5 minutes after completion.', 
       inputSchema: { 
         type: 'object', 
         properties: {} 
       } 
     },
-    { name: 'view', description: 'View file contents or directory listing. For files: returns content with line numbers. For directories: returns list of files and subdirectories with [FILE] and [DIR] markers. Optionally specify line range for large files.', inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'File or directory path (relative to working directory)' }, lines: { type: 'array', items: { type: 'number' }, description: '[start, end] line numbers (1-indexed, end=-1 for EOF)' } }, required: ['path'] } },
-    { name: 'grep', description: 'Search for a pattern in files. Can search a single file or recursively through directories. Returns matching lines with file path and line number.', inputSchema: { type: 'object', properties: { pattern: { type: 'string', description: 'Search pattern (regex supported)' }, path: { type: 'string', description: 'File or directory path (relative to working directory)' }, recursive: { type: 'boolean', description: 'Search directories recursively (default: false)' }, ignoreCase: { type: 'boolean', description: 'Case-insensitive search (default: false)' }, filePattern: { type: 'string', description: 'Filter files by pattern (e.g. "\\.cs$" for C# files)' }, maxResults: { type: 'number', description: 'Maximum results to return (default: 100)' } }, required: ['pattern', 'path'] } },
+    { name: 'view', description: 'READ-ONLY: View file contents or directory listing. Does not modify files.\n\nFor files: returns content with line numbers. For directories: returns list of files and subdirectories with [FILE] and [DIR] markers. Optionally specify line range for large files.', inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'File or directory path (relative to working directory)' }, lines: { type: 'array', items: { type: 'number' }, description: '[start, end] line numbers (1-indexed, end=-1 for EOF)' } }, required: ['path'] } },
+    { name: 'grep', description: 'READ-ONLY: Search for a pattern in files. Does not modify files.\n\nCan search a single file or recursively through directories. Returns matching lines with file path and line number.', inputSchema: { type: 'object', properties: { pattern: { type: 'string', description: 'Search pattern (regex supported)' }, path: { type: 'string', description: 'File or directory path (relative to working directory)' }, recursive: { type: 'boolean', description: 'Search directories recursively (default: false)' }, ignoreCase: { type: 'boolean', description: 'Case-insensitive search (default: false)' }, filePattern: { type: 'string', description: 'Filter files by pattern (e.g. "\\.cs$" for C# files)' }, maxResults: { type: 'number', description: 'Maximum results to return (default: 100)' } }, required: ['pattern', 'path'] } },
     { name: 'str_replace', description: 'Replace a unique string in a file with another string. The old_str must appear exactly once in the file (this prevents accidental multiple replacements). Use this for precise edits to existing files.', inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'Path to file (relative to working directory)' }, old_str: { type: 'string', description: 'String to replace (must be unique in file)' }, new_str: { type: 'string', description: 'Replacement string (omit or use empty string to delete)' } }, required: ['path', 'old_str'] } },
     { name: 'file_create', description: 'Create a new file with the specified content. Creates parent directories automatically if needed. Will overwrite existing files.', inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'Path to file (relative to working directory)' }, file_text: { type: 'string', description: 'Complete file content' } }, required: ['path', 'file_text'] } },
     { name: 'file_delete', description: 'Delete a single file. Does NOT support wildcards or directories. For bulk deletion or directory removal, use the task() tool with Claude Code.', inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'Path to file (relative to working directory)' } }, required: ['path'] } },
@@ -319,35 +342,10 @@ function getTools(isAdmin = false) {
     { name: 'file_move', description: 'Move or rename a file. Can move files between directories. Automatically creates destination directory if needed.', inputSchema: { type: 'object', properties: { source: { type: 'string', description: 'Source file path (relative to working directory)' }, destination: { type: 'string', description: 'Destination file path (relative to working directory)' } }, required: ['source', 'destination'] } },
     { name: 'unity-editor', description: 'Call a Unity Editor MCP tool directly (port 3002). Includes default tools (play, stop, pause, status, viewlog) and any custom tools configured by the user. This bypasses Claude Code for instant Unity Editor control. IMPORTANT: Unity only compiles when it is the foreground application. After file operations, remind the user to focus Unity to trigger compilation.', inputSchema: { type: 'object', properties: { tool: { type: 'string', description: 'Tool name to call (e.g. "play", "status", "viewlog"). Use unity-tools to see all available tools.' }, args: { type: 'object', description: 'Tool arguments as key-value pairs (e.g. {"lines": [1, 100]})' } }, required: ['tool'] } },
     { name: 'unity-game', description: 'Call a Unity Game MCP tool directly (port 3003) during Play Mode. Includes default tools (status, execute, viewlog) and any custom tools configured by the user. This bypasses Claude Code for instant game runtime control.', inputSchema: { type: 'object', properties: { tool: { type: 'string', description: 'Tool name to call (e.g. "execute", "status", "viewlog"). Use unity-tools to see all available tools.' }, args: { type: 'object', description: 'Tool arguments as key-value pairs (e.g. {"script": "return 2+2"})' } }, required: ['tool'] } },
-    { name: 'unity-tools', description: 'List all available Unity MCP tools from both Editor (port 3002) and Game (port 3003) servers. Shows tool names, descriptions, and required parameters.', inputSchema: { type: 'object', properties: {} } }
+    { name: 'unity-tools', description: 'READ-ONLY: List all available Unity MCP tools from both Editor (port 3002) and Game (port 3003) servers. Does not modify files or control Unity.\n\nShows tool names, descriptions, and required parameters.', inputSchema: { type: 'object', properties: {} } }
   ];
   
-  // Add admin tool only for admin users
-  if (isAdmin) {
-    tools.push({
-      name: 'admin',
-      description: 'Admin tool for managing authorized nodes. Subcommands: user-list (list all nodes), user-add (add node), user-delete (remove node). Only visible to admin users.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          subcommand: {
-            type: 'string',
-            enum: ['user-list', 'user-add', 'user-delete'],
-            description: 'Admin subcommand to execute'
-          },
-          nodeId: {
-            type: 'string',
-            description: 'Node ID/token (required for user-add and user-delete)'
-          },
-          isAdmin: {
-            type: 'boolean',
-            description: 'Make the node an admin (only for user-add, default: false)'
-          }
-        },
-        required: ['subcommand']
-      }
-    });
-  }
+  // Admin tool removed - now handled via WebSocket commands from client
   
   return tools;
 }
@@ -381,6 +379,21 @@ ${authorizedNodes.admins.map(n => `• ${n}${n === currentNodeId ? ' [YOU]' : ''
         return { content: [{ type: 'text', text: '❌ Missing nodeId parameter' }] };
       }
       
+      // Validate token format (username:secret)
+      const parts = nodeId.split(':');
+      if (parts.length !== 2) {
+        return { content: [{ type: 'text', text: '❌ Invalid format. Use: username:secret' }] };
+      }
+      
+      const [username, secret] = parts;
+      if (!username || username.length < 3) {
+        return { content: [{ type: 'text', text: '❌ Username must be at least 3 characters' }] };
+      }
+      
+      if (!secret || secret.length < 16) {
+        return { content: [{ type: 'text', text: '❌ Secret must be at least 16 characters' }] };
+      }
+      
       // Add to appropriate lists
       if (makeAdmin) {
         if (!authorizedNodes.admins.includes(nodeId)) {
@@ -395,8 +408,8 @@ ${authorizedNodes.admins.map(n => `• ${n}${n === currentNodeId ? ' [YOU]' : ''
         }
       }
       
-      if (saveAuthorizedNodes(authorizedNodes)) {
-        console.log(`✓ Node added${makeAdmin ? ' (admin)' : ''}`);
+      if (await saveAuthorizedNodes(authorizedNodes)) {
+        console.log(`✓ Node added: ${username}${makeAdmin ? ' (admin)' : ''}`);
         return { content: [{ type: 'text', text: `✅ Node added: ${nodeId}${makeAdmin ? ' (admin)' : ''}` }] };
       } else {
         return { content: [{ type: 'text', text: '❌ Failed to save nodes file' }] };
@@ -412,12 +425,23 @@ ${authorizedNodes.admins.map(n => `• ${n}${n === currentNodeId ? ' [YOU]' : ''
         return { content: [{ type: 'text', text: '❌ Cannot delete yourself. Ask another admin to remove you if needed.' }] };
       }
       
+      // Check if user exists before attempting deletion
+      const existsInNodes = authorizedNodes.nodes.includes(nodeId);
+      const existsInAdmins = authorizedNodes.admins.includes(nodeId);
+      
+      if (!existsInNodes && !existsInAdmins) {
+        return { content: [{ type: 'text', text: `❌ User not found: ${nodeId}` }] };
+      }
+      
+      // Extract username for logging (don't log secret)
+      const deletedUsername = nodeId.split(':')[0];
+      
       // Remove from both lists
       authorizedNodes.nodes = authorizedNodes.nodes.filter(n => n !== nodeId);
       authorizedNodes.admins = authorizedNodes.admins.filter(n => n !== nodeId);
       
-      if (saveAuthorizedNodes(authorizedNodes)) {
-        console.log(`✓ Node removed`);
+      if (await saveAuthorizedNodes(authorizedNodes)) {
+        console.log(`✓ Node removed: ${deletedUsername}`);
         return { content: [{ type: 'text', text: `✅ Node removed: ${nodeId}` }] };
       } else {
         return { content: [{ type: 'text', text: '❌ Failed to save nodes file' }] };
@@ -429,10 +453,18 @@ ${authorizedNodes.admins.map(n => `• ${n}${n === currentNodeId ? ' [YOU]' : ''
 }
 
 function formatOfflineMessage() {
-  return `⚠️ AIRON Node Offline - Ask user to run: airon https://dev.airon.games/mcp`;
+  return `⚠️ AIRON Node Offline
+
+Make sure to ask what is the user preference before continuing.
+
+Options:
+1. Start the AIRON node on your dev machine (run: airon https://dev.airon.games/mcp)
+2. Continue working with local bash tools only
+
+Note: Remote Unity control, Claude Code sessions, and file operations require the node to be online.`;
 }
 
-function forwardToNode(ws, request, timeout = 120000) {
+function forwardToNode(ws, request, timeout = FORWARD_TIMEOUT) {
   return new Promise((resolve, reject) => {
     // Check pending request limits
     if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
@@ -488,6 +520,37 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
+      
+      // Handle admin commands from client
+      if (msg.type === 'admin') {
+        const isAdmin = authorizedNodes && authorizedNodes.admins.includes(ws.token);
+        if (!isAdmin) {
+          ws.send(JSON.stringify({ 
+            type: 'admin_response', 
+            id: msg.id, 
+            error: 'Admin access required' 
+          }));
+          return;
+        }
+        
+        // Execute admin command
+        handleAdminTool(msg.args || {}, ws.token).then(result => {
+          ws.send(JSON.stringify({ 
+            type: 'admin_response', 
+            id: msg.id, 
+            result: result.content[0].text 
+          }));
+        }).catch(err => {
+          ws.send(JSON.stringify({ 
+            type: 'admin_response', 
+            id: msg.id, 
+            error: err.message 
+          }));
+        });
+        return;
+      }
+      
+      // Handle normal MCP tool responses
       if (msg.id && pendingRequests.has(msg.id)) {
         const { resolve } = pendingRequests.get(msg.id);
         pendingRequests.delete(msg.id);
@@ -532,13 +595,20 @@ app.get('/health', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => { 
-  console.log('AIRON Relay started on port ' + PORT);
+
+async function start() {
+  authorizedNodes = await loadAuthorizedNodes();
   
-  if (authorizedNodes === null) {
-    console.log('⚠️  ERROR: No airon-nodes.json found and AIRON_ADMIN_NODE not set.');
-    console.log('⚠️  Server will reject all connections. Set AIRON_ADMIN_NODE environment variable.');
-  } else {
-    console.log(`✓ Authorized nodes: ${authorizedNodes.nodes.length}, Admins: ${authorizedNodes.admins.length}`);
-  }
-});
+  server.listen(PORT, () => { 
+    console.log('AIRON Relay started on port ' + PORT);
+    
+    if (authorizedNodes === null) {
+      console.log('⚠️  ERROR: No airon-nodes.json found and AIRON_ADMIN_NODE not set.');
+      console.log('⚠️  Server will reject all connections. Set AIRON_ADMIN_NODE environment variable.');
+    } else {
+      console.log(`✓ Authorized nodes: ${authorizedNodes.nodes.length}, Admins: ${authorizedNodes.admins.length}`);
+    }
+  });
+}
+
+start();

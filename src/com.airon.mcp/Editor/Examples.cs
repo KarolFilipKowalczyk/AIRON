@@ -38,23 +38,29 @@ namespace AIRON.MCP
         /// </summary>
         public static string LoadScene(string sceneName)
         {
+            // Cannot load scenes during Play Mode
+            if (EditorApplication.isPlaying)
+            {
+                return "Cannot load scenes during Play Mode. Exit Play Mode first.";
+            }
+
             // Find the scene asset
             var sceneGuids = AssetDatabase.FindAssets($"t:Scene {sceneName}");
-            
+
             if (sceneGuids.Length == 0)
             {
                 return $"Scene '{sceneName}' not found in project";
             }
-            
+
             var scenePath = AssetDatabase.GUIDToAssetPath(sceneGuids[0]);
-            
+
             // Ask to save current scene if modified
             if (EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo())
             {
                 EditorSceneManager.OpenScene(scenePath);
                 return $"Loaded scene: {sceneName}";
             }
-            
+
             return "Scene load cancelled by user";
         }
     }

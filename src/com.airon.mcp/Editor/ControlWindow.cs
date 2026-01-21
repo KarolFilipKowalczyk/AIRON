@@ -5,64 +5,103 @@ namespace AIRON.MCP
 {
     public class ControlWindow : EditorWindow
     {
-        private const string EDITOR_AUTOSTART_KEY = "AIRON_EditorMCP_AutoStart";
-        private const string GAME_AUTOSTART_KEY = "AIRON_GameMCP_AutoStart";
-        private const string EDITOR_CUSTOM_TOOLS_KEY = "AIRON_EditorMCP_CustomTools";
-        private const string EDITOR_CUSTOM_TOOLS_INITIALIZED_KEY = "AIRON_EditorMCP_CustomTools_Initialized";
-        private const string GAME_CUSTOM_TOOLS_KEY = "AIRON_GameMCP_CustomTools";
-        private const string GAME_CUSTOM_TOOLS_INITIALIZED_KEY = "AIRON_GameMCP_CustomTools_Initialized";
-        
         private Vector2 scrollPosition;
         private bool showCustomTools = false;
         private bool showGameCustomTools = false;
+
+        private ConfigManager.AironConfig config;
+        private bool configLoaded = false;
         
-        private static string pendingSecret = null;
-        private static double secretChangeTime = 0;
-        private const double SECRET_RESTART_DELAY = 1.0; // 1 second delay
-        
-        [MenuItem("Window/AIRON Control/Open Window")]
+        [MenuItem("Window/AIRON Control/Open Window", false, 1)]
         public static void ShowWindow()
         {
             var window = GetWindow<ControlWindow>("AIRON Control");
             window.minSize = new Vector2(400, 300);
         }
-        
-        [MenuItem("Window/AIRON Control/Reset Editor MCP Custom Tools")]
-        public static void ResetEditorCustomTools()
+
+        [MenuItem("Window/AIRON Control/Open Config File", false, 2)]
+        public static void OpenConfigFile()
         {
-            EditorPrefs.DeleteKey(EDITOR_CUSTOM_TOOLS_KEY);
-            EditorPrefs.DeleteKey(EDITOR_CUSTOM_TOOLS_INITIALIZED_KEY);
-            
-            // Restart server to reload defaults
-            if (EditorMCPServer.IsRunning())
+            string configPath = ConfigManager.GetConfigFilePath();
+
+            if (!ConfigManager.ConfigFileExists())
             {
-                EditorMCPServer.Stop();
-                EditorMCPServer.Start();
+                if (EditorUtility.DisplayDialog(
+                    "Config File Not Found",
+                    "Configuration file doesn't exist yet. Would you like to create it?",
+                    "Create", "Cancel"))
+                {
+                    var config = ConfigManager.LoadConfig();
+                    ConfigManager.SaveConfig(config);
+                }
+                else
+                {
+                    return;
+                }
             }
+
+            EditorUtility.RevealInFinder(configPath);
         }
-        
-        [MenuItem("Window/AIRON Control/Reset Game MCP Custom Tools")]
-        public static void ResetGameCustomTools()
+
+        [MenuItem("Window/AIRON Control/Reset to Examples", false, 3)]
+        public static void ResetToExamples()
         {
-            EditorPrefs.DeleteKey(GAME_CUSTOM_TOOLS_KEY);
-            EditorPrefs.DeleteKey(GAME_CUSTOM_TOOLS_INITIALIZED_KEY);
+            if (!EditorUtility.DisplayDialog(
+                "Reset Configuration",
+                "This will delete the configuration file and reset all AIRON settings to example defaults.\n\nContinue?",
+                "Reset", "Cancel"))
+            {
+                return;
+            }
+
+            ConfigManager.DeleteConfigFile();
+
+            // Restart server to reload defaults
+            if (ServerEditor.IsRunning())
+            {
+                ServerEditor.Stop();
+                ServerEditor.Start();
+            }
+
+            // Force reload in any open window
+            var window = GetWindow<ControlWindow>(false, null, false);
+            if (window)
+            {
+                window.configLoaded = false;
+                window.Repaint();
+            }
+
+            EditorUtility.DisplayDialog("Reset Complete", "AIRON configuration has been reset to examples.", "OK");
         }
 
         private void OnGUI()
         {
+            // Load config if not loaded
+            if (!configLoaded || config == null)
+            {
+                config = ConfigManager.LoadConfig();
+                configLoaded = true;
+            }
+
             scrollPosition = EditorGUILayout.BeginScrollView(scrollPosition);
-            
+
             // Header
             GUILayout.Space(10);
             GUILayout.Label("AIRON MCP Server Control", EditorStyles.boldLabel);
             GUILayout.Space(10);
-            
-            EditorGUILayout.HelpBox(
-                "Monitor and configure MCP servers for Claude Code integration. " +
-                "These servers enable remote Unity Editor control.",
-                MessageType.Info
-            );
-            
+
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Button("Open README", GUILayout.Height(24)))
+            {
+                string readmePath = System.IO.Path.GetFullPath("Packages/com.airon.mcp/README.md");
+                EditorUtility.RevealInFinder(readmePath);
+            }
+            if (GUILayout.Button("Open Config", GUILayout.Height(24)))
+            {
+                OpenConfigFile();
+            }
+            EditorGUILayout.EndHorizontal();
+
             GUILayout.Space(10);
             
             // Editor MCP Server Section
@@ -73,482 +112,293 @@ namespace AIRON.MCP
             // Game MCP Server Section
             DrawGameMCPSection();
             
-            GUILayout.Space(20);
-            
-            // Authentication section at the bottom
-            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-            GUILayout.Label("🔒 Authentication (Optional)", EditorStyles.boldLabel);
-            GUILayout.Space(5);
-            
-            EditorGUILayout.HelpBox(
-                "Set a secret token to secure MCP server access.\n" +
-                "Leave empty to allow unauthenticated localhost access (suitable for Claude Code).",
-                MessageType.Info
-            );
-            
-            string currentSecret = EditorPrefs.GetString("AIRON_EditorMCP_Secret", "");
-            string newSecret = EditorGUILayout.PasswordField("Secret Token (optional):", currentSecret);
-            
-            if (newSecret != currentSecret)
-            {
-                EditorPrefs.SetString("AIRON_EditorMCP_Secret", newSecret);
-                
-                // Schedule delayed restart
-                pendingSecret = newSecret;
-                secretChangeTime = EditorApplication.timeSinceStartup;
-            }
-            
-            if (string.IsNullOrEmpty(currentSecret))
-            {
-                EditorGUILayout.HelpBox(
-                    "ℹ️ Servers running without authentication. Recommended to set a secret for airon.js connections.",
-                    MessageType.Info
-                );
-            }
-            
-            EditorGUILayout.EndVertical();
-            
             EditorGUILayout.EndScrollView();
         }
 
         private void DrawEditorMCPSection()
         {
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-            
-            int currentPort = EditorPrefs.GetInt("AIRON_EditorMCP_Port", 3002);
-            GUILayout.Label($"Editor MCP Server (Port {currentPort})", EditorStyles.boldLabel);
-            GUILayout.Space(5);
-            
-            bool isRunning = EditorMCPServer.IsRunning();
-            
-            // Status indicator
+
+            bool isRunning = ServerEditor.IsRunning();
+
+            // Title + Status on same line
             EditorGUILayout.BeginHorizontal();
-            GUILayout.Label("Status:", GUILayout.Width(80));
-            
-            var oldColor = GUI.color;
-            GUI.color = isRunning ? Color.green : Color.red;
+            GUILayout.Label("Editor MCP Server", EditorStyles.boldLabel);
+            var oldColor = UnityEngine.GUI.color;
+            UnityEngine.GUI.color = isRunning ? Color.green : Color.red;
             GUILayout.Label(isRunning ? "● Running" : "● Stopped", EditorStyles.boldLabel);
-            GUI.color = oldColor;
-            
+            UnityEngine.GUI.color = oldColor;
+            GUILayout.FlexibleSpace();
             EditorGUILayout.EndHorizontal();
-            
-            GUILayout.Space(10);
-            
-            // Port configuration
+
+            GUILayout.Space(5);
+
+            // Port + Enabled on same line
             EditorGUILayout.BeginHorizontal();
-            GUILayout.Label("Port:", GUILayout.Width(80));
-            int newPort = EditorGUILayout.IntField(currentPort, GUILayout.Width(80));
+            GUILayout.Label("Port:", GUILayout.Width(35));
+            int newPort = EditorGUILayout.IntField(config.editorPort, GUILayout.Width(60));
+            GUILayout.Space(20);
+            GUILayout.Label("Enabled:", GUILayout.Width(55));
+            bool newAutoStart = EditorGUILayout.Toggle(config.editorAutoStart, GUILayout.Width(20));
+            GUILayout.FlexibleSpace();
             EditorGUILayout.EndHorizontal();
-            
-            if (newPort != currentPort && newPort >= 1024 && newPort <= 65535)
+
+            if (newPort != config.editorPort && Constants.IsValidPort(newPort))
             {
-                EditorPrefs.SetInt("AIRON_EditorMCP_Port", newPort);
-                
+                config.editorPort = newPort;
+                ConfigManager.SaveConfig(config);
+
                 // Restart server if running
                 if (isRunning)
                 {
-                    EditorMCPServer.Stop();
-                    EditorMCPServer.Start();
+                    ServerEditor.Stop();
+                    ServerEditor.Start();
                 }
             }
-            
-            GUILayout.Space(10);
-            
-            // Auto-start toggle (now always enabled)
-            bool autoStart = EditorPrefs.GetBool(EDITOR_AUTOSTART_KEY, true);
-            bool newAutoStart = EditorGUILayout.Toggle("Enable Auto-Start", autoStart);
-            
-            if (newAutoStart != autoStart)
+
+            if (newAutoStart != config.editorAutoStart)
             {
-                EditorPrefs.SetBool(EDITOR_AUTOSTART_KEY, newAutoStart);
-                
+                config.editorAutoStart = newAutoStart;
+                ConfigManager.SaveConfig(config);
+
                 if (newAutoStart && !isRunning)
                 {
-                    EditorMCPServer.Start();
+                    ServerEditor.Start();
                 }
                 else if (!newAutoStart && isRunning)
                 {
-                    EditorMCPServer.Stop();
+                    ServerEditor.Stop();
                 }
             }
-            
+
             GUILayout.Space(5);
-            
+
             EditorGUILayout.HelpBox(
-                "Editor MCP provides tools for Unity Editor control:\n" +
-                "• Play/Stop/Pause control\n" +
-                "• AssetDatabase refresh\n" +
-                "• Editor status queries",
+                "Tools: Status, Play, Stop, Pause + custom",
                 MessageType.None
             );
-            
+
             GUILayout.Space(10);
-            
+
             // Custom Tools Section
             showCustomTools = EditorGUILayout.Foldout(showCustomTools, "Custom Tools", true);
             if (showCustomTools)
             {
                 DrawCustomToolsEditor();
             }
-            
+
             EditorGUILayout.EndVertical();
         }
         
         private void DrawCustomToolsEditor()
         {
-            EditorGUI.indentLevel++;
-            
-            bool isInitialized = EditorPrefs.GetBool(EDITOR_CUSTOM_TOOLS_INITIALIZED_KEY, false);
-            var customToolsJson = EditorPrefs.GetString(EDITOR_CUSTOM_TOOLS_KEY, "");
-            
-            // If never initialized, load defaults
-            if (!isInitialized)
-            {
-                var defaultTools = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, string>>
+            DrawToolsEditor(
+                config.editorTools,
+                "AIRON.MCP.Examples.ListScenes",
+                null, // No additional note for editor tools
+                () =>
                 {
-                    new() { { "toolName", "AIRON.MCP.Examples.ListScenes" }, { "description", "List all scenes in the project" } },
-                    new() { { "toolName", "AIRON.MCP.Examples.LoadScene" }, { "description", "Load a scene by name" } }
-                };
-                customToolsJson = Newtonsoft.Json.JsonConvert.SerializeObject(defaultTools);
-                EditorPrefs.SetString(EDITOR_CUSTOM_TOOLS_KEY, customToolsJson);
-                EditorPrefs.SetBool(EDITOR_CUSTOM_TOOLS_INITIALIZED_KEY, true);
-            }
-            
-            var toolList = Newtonsoft.Json.JsonConvert.DeserializeObject<System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, string>>>(customToolsJson);
-            
-            if (toolList == null)
-                toolList = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, string>>();
-            
+                    // Restart editor server to pick up changes
+                    ServerEditor.Stop();
+                    ServerEditor.Start();
+                }
+            );
+        }
+
+        /// <summary>
+        /// Generic method to draw a custom tools editor UI.
+        /// </summary>
+        /// <param name="tools">The list of tools to edit</param>
+        /// <param name="exampleToolName">Example tool name to show in help box</param>
+        /// <param name="additionalNote">Additional note to append to help text (optional)</param>
+        /// <param name="onModified">Action to call when tools are modified (optional)</param>
+        private void DrawToolsEditor(
+            System.Collections.Generic.List<ConfigManager.CustomTool> tools,
+            string exampleToolName,
+            string additionalNote,
+            System.Action onModified)
+        {
+            EditorGUI.indentLevel++;
+
             bool modified = false;
-            
+
             // Display and edit existing tools
-            for (int i = 0; i < toolList.Count; i++)
+            for (int i = 0; i < tools.Count; i++)
             {
                 EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-                
-                var tool = toolList[i];
-                var toolName = tool.ContainsKey("toolName") ? tool["toolName"] : "";
-                var description = tool.ContainsKey("description") ? tool["description"] : "";
-                
+
+                var tool = tools[i];
+
                 EditorGUILayout.BeginHorizontal();
                 EditorGUILayout.LabelField($"Tool {i + 1}", EditorStyles.boldLabel, GUILayout.Width(60));
                 if (GUILayout.Button("Delete", GUILayout.Width(60)))
                 {
-                    toolList.RemoveAt(i);
+                    tools.RemoveAt(i);
                     modified = true;
                     EditorGUILayout.EndHorizontal();
                     EditorGUILayout.EndVertical();
                     break;
                 }
                 EditorGUILayout.EndHorizontal();
-                
-                var newToolName = EditorGUILayout.TextField("Tool Name", toolName);
-                var newDescription = EditorGUILayout.TextField("Description", description);
-                
-                if (newToolName != toolName || newDescription != description)
+
+                var newToolName = EditorGUILayout.TextField("Tool Name", tool.toolName);
+                var newDescription = EditorGUILayout.TextField("Description", tool.description);
+
+                if (newToolName != tool.toolName || newDescription != tool.description)
                 {
-                    tool["toolName"] = newToolName;
-                    tool["description"] = newDescription;
+                    tool.toolName = newToolName;
+                    tool.description = newDescription;
                     modified = true;
                 }
-                
+
                 EditorGUILayout.EndVertical();
                 GUILayout.Space(5);
             }
-            
+
             GUILayout.Space(10);
-            
+
             // Add new tool button
             if (GUILayout.Button("+ Add New Tool", GUILayout.Height(30)))
             {
-                var newTool = new System.Collections.Generic.Dictionary<string, string>
-                {
-                    { "toolName", "" },
-                    { "description", "" }
-                };
-                toolList.Add(newTool);
+                tools.Add(new ConfigManager.CustomTool("", ""));
                 modified = true;
             }
-            
+
             GUILayout.Space(5);
-            
-            EditorGUILayout.HelpBox(
-                "Format: Namespace.ClassName.MethodName\n" +
-                "Example: AIRON.MCP.Examples.ListScenes\n\n" +
-                "The method must be public and static.",
-                MessageType.Info
-            );
-            
+
+            // Build help text
+            string helpText = $"Format: Namespace.ClassName.MethodName\n" +
+                              $"Example: {exampleToolName}\n\n" +
+                              "The method must be public and static.";
+
+            if (!string.IsNullOrEmpty(additionalNote))
+            {
+                helpText += $"\n{additionalNote}";
+            }
+
+            EditorGUILayout.HelpBox(helpText, MessageType.Info);
+
             // Save if modified
             if (modified)
             {
-                SaveCustomTools(toolList);
-                
-                // Restart server to pick up changes
-                EditorMCPServer.Stop();
-                EditorMCPServer.Start();
+                ConfigManager.SaveConfig(config);
+                onModified?.Invoke();
             }
-            
+
             EditorGUI.indentLevel--;
-        }
-        
-        private void SaveCustomTools(System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, string>> toolList)
-        {
-            var json = Newtonsoft.Json.JsonConvert.SerializeObject(toolList);
-            EditorPrefs.SetString(EDITOR_CUSTOM_TOOLS_KEY, json);
         }
 
         private void DrawGameMCPSection()
         {
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-            
-            int currentPort = EditorPrefs.GetInt("AIRON_GameMCP_Port", 3003);
-            GUILayout.Label($"Game MCP Server (Port {currentPort})", EditorStyles.boldLabel);
-            GUILayout.Space(5);
-            
+
             bool isInPlayMode = EditorApplication.isPlaying;
             bool gameServerExists = FindGameMCPServer();
-            bool autoStart = EditorPrefs.GetBool(GAME_AUTOSTART_KEY, true);
-            
-            // Status indicator
+
+            // Title + Status on same line
             EditorGUILayout.BeginHorizontal();
-            GUILayout.Label("Status:", GUILayout.Width(80));
-            
-            var oldColor = GUI.color;
-            
-            if (!autoStart)
+            GUILayout.Label("Game MCP Server", EditorStyles.boldLabel);
+
+            var oldColor = UnityEngine.GUI.color;
+            if (!config.gameAutoStart)
             {
-                // Always show disabled if auto-start is off
-                GUI.color = Color.red;
+                UnityEngine.GUI.color = Color.red;
                 GUILayout.Label("● Disabled", EditorStyles.boldLabel);
             }
             else if (isInPlayMode && gameServerExists)
             {
-                GUI.color = Color.green;
+                UnityEngine.GUI.color = Color.green;
                 GUILayout.Label("● Running", EditorStyles.boldLabel);
             }
             else if (isInPlayMode && !gameServerExists)
             {
-                GUI.color = Color.yellow;
+                UnityEngine.GUI.color = Color.yellow;
                 GUILayout.Label("● Starting...", EditorStyles.boldLabel);
             }
             else
             {
-                GUI.color = Color.gray;
-                GUILayout.Label("● Waiting for Play Mode", EditorStyles.boldLabel);
+                UnityEngine.GUI.color = Color.gray;
+                GUILayout.Label("● Standby", EditorStyles.boldLabel);
             }
-            
-            GUI.color = oldColor;
-            
+            UnityEngine.GUI.color = oldColor;
+            GUILayout.FlexibleSpace();
             EditorGUILayout.EndHorizontal();
-            
-            GUILayout.Space(10);
-            
-            // Port configuration
+
+            GUILayout.Space(5);
+
+            // Port + Enabled on same line
             EditorGUILayout.BeginHorizontal();
-            GUILayout.Label("Port:", GUILayout.Width(80));
-            int newPort = EditorGUILayout.IntField(currentPort, GUILayout.Width(80));
+            GUILayout.Label("Port:", GUILayout.Width(35));
+            int newPort = EditorGUILayout.IntField(config.gamePort, GUILayout.Width(60));
+            GUILayout.Space(20);
+            GUILayout.Label("Enabled:", GUILayout.Width(55));
+            bool newAutoStart = EditorGUILayout.Toggle(config.gameAutoStart, GUILayout.Width(20));
+            GUILayout.FlexibleSpace();
             EditorGUILayout.EndHorizontal();
-            
-            if (newPort != currentPort && newPort >= 1024 && newPort <= 65535)
+
+            if (newPort != config.gamePort && Constants.IsValidPort(newPort))
             {
-                EditorPrefs.SetInt("AIRON_GameMCP_Port", newPort);
-                
-                // Note: Server will use new port on next Play Mode entry
-                if (isInPlayMode && gameServerExists)
-                {
-                    EditorGUILayout.HelpBox(
-                        "Port will change on next Play Mode entry. Exit and re-enter Play Mode to apply.",
-                        MessageType.Info
-                    );
-                }
+                config.gamePort = newPort;
+                ConfigManager.SaveConfig(config);
             }
-            
-            GUILayout.Space(10);
-            
-            // Auto-start toggle
-            bool newAutoStart = EditorGUILayout.Toggle("Enable Auto-Start", autoStart);
-            
-            if (newAutoStart != autoStart)
+
+            if (newAutoStart != config.gameAutoStart)
             {
-                EditorPrefs.SetBool(GAME_AUTOSTART_KEY, newAutoStart);
+                config.gameAutoStart = newAutoStart;
+                ConfigManager.SaveConfig(config);
             }
-            
+
             GUILayout.Space(5);
-            
-            if (!autoStart)
-            {
-                EditorGUILayout.HelpBox(
-                    "Game MCP Server auto-start is disabled. Enable it to allow Lua script execution in Play Mode.",
-                    MessageType.Warning
-                );
-            }
-            else if (!isInPlayMode)
-            {
-                EditorGUILayout.HelpBox(
-                    "Game MCP Server will start automatically when entering Play Mode.",
-                    MessageType.Info
-                );
-            }
-            
-            GUILayout.Space(5);
-            
+
             EditorGUILayout.HelpBox(
-                "Game MCP provides tools for runtime control:\n" +
-                "• Lua script execution\n" +
-                "• Game status queries\n" +
-                "• Scene information",
+                "Tools: Status, ViewLog + custom",
                 MessageType.None
             );
-            
+
             GUILayout.Space(10);
-            
+
             // Custom Tools Section
             showGameCustomTools = EditorGUILayout.Foldout(showGameCustomTools, "Custom Tools", true);
             if (showGameCustomTools)
             {
                 DrawGameCustomToolsEditor();
             }
-            
+
             EditorGUILayout.EndVertical();
         }
         
         private void DrawGameCustomToolsEditor()
         {
-            EditorGUI.indentLevel++;
-            
-            bool isInitialized = EditorPrefs.GetBool(GAME_CUSTOM_TOOLS_INITIALIZED_KEY, false);
-            var customToolsJson = EditorPrefs.GetString(GAME_CUSTOM_TOOLS_KEY, "");
-            
-            // If never initialized, load defaults
-            if (!isInitialized)
-            {
-                var defaultTools = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, string>>
-                {
-                    new() { { "toolName", "AIRON.MCP.RuntimeExamples.GetLoadedScenes" }, { "description", "Get all loaded scenes" } },
-                    new() { { "toolName", "AIRON.MCP.RuntimeExamples.SwitchScene" }, { "description", "Switch to a scene by name" } }
-                };
-                customToolsJson = Newtonsoft.Json.JsonConvert.SerializeObject(defaultTools);
-                EditorPrefs.SetString(GAME_CUSTOM_TOOLS_KEY, customToolsJson);
-                EditorPrefs.SetBool(GAME_CUSTOM_TOOLS_INITIALIZED_KEY, true);
-            }
-            
-            var toolList = Newtonsoft.Json.JsonConvert.DeserializeObject<System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, string>>>(customToolsJson);
-            
-            if (toolList == null)
-                toolList = new System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, string>>();
-            
-            bool modified = false;
-            
-            // Display and edit existing tools
-            for (int i = 0; i < toolList.Count; i++)
-            {
-                EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-                
-                var tool = toolList[i];
-                var toolName = tool.ContainsKey("toolName") ? tool["toolName"] : "";
-                var description = tool.ContainsKey("description") ? tool["description"] : "";
-                
-                EditorGUILayout.BeginHorizontal();
-                EditorGUILayout.LabelField($"Tool {i + 1}", EditorStyles.boldLabel, GUILayout.Width(60));
-                if (GUILayout.Button("Delete", GUILayout.Width(60)))
-                {
-                    toolList.RemoveAt(i);
-                    modified = true;
-                    EditorGUILayout.EndHorizontal();
-                    EditorGUILayout.EndVertical();
-                    break;
-                }
-                EditorGUILayout.EndHorizontal();
-                
-                var newToolName = EditorGUILayout.TextField("Tool Name", toolName);
-                var newDescription = EditorGUILayout.TextField("Description", description);
-                
-                if (newToolName != toolName || newDescription != description)
-                {
-                    tool["toolName"] = newToolName;
-                    tool["description"] = newDescription;
-                    modified = true;
-                }
-                
-                EditorGUILayout.EndVertical();
-                GUILayout.Space(5);
-            }
-            
-            GUILayout.Space(10);
-            
-            // Add new tool button
-            if (GUILayout.Button("+ Add New Tool", GUILayout.Height(30)))
-            {
-                var newTool = new System.Collections.Generic.Dictionary<string, string>
-                {
-                    { "toolName", "" },
-                    { "description", "" }
-                };
-                toolList.Add(newTool);
-                modified = true;
-            }
-            
-            GUILayout.Space(5);
-            
-            EditorGUILayout.HelpBox(
-                "Format: Namespace.ClassName.MethodName\n" +
-                "Example: AIRON.MCP.RuntimeExamples.GetCurrentScene\n\n" +
-                "The method must be public and static.\n" +
+            DrawToolsEditor(
+                config.gameTools,
+                "AIRON.MCP.RuntimeExamples.GetCurrentScene",
                 "Note: Changes apply when entering Play Mode.",
-                MessageType.Info
+                null // No server restart needed for game tools
             );
-            
-            // Save if modified
-            if (modified)
-            {
-                SaveGameCustomTools(toolList);
-            }
-            
-            EditorGUI.indentLevel--;
-        }
-        
-        private void SaveGameCustomTools(System.Collections.Generic.List<System.Collections.Generic.Dictionary<string, string>> toolList)
-        {
-            var json = Newtonsoft.Json.JsonConvert.SerializeObject(toolList);
-            EditorPrefs.SetString(GAME_CUSTOM_TOOLS_KEY, json);
         }
 
         private bool FindGameMCPServer()
         {
             // GameMCPServer is in Runtime assembly, check if it exists by looking for the GameObject
-            var gameObject = GameObject.Find("[AIRON Game MCP]");
+            var gameObject = GameObject.Find(Constants.GameServerObjectName);
             return gameObject != null && gameObject.GetComponent<MonoBehaviour>() != null;
         }
         
         private void Update()
         {
-            // Trigger auto-start if enabled but server not running
-            bool autoStart = EditorPrefs.GetBool(EDITOR_AUTOSTART_KEY, true);
-            bool isRunning = EditorMCPServer.IsRunning();
-            
-            if (autoStart && !isRunning && pendingSecret == null)
+            // Reload config if not loaded
+            if (!configLoaded || config == null)
             {
-                EditorMCPServer.Start();
+                config = ConfigManager.LoadConfig();
+                configLoaded = true;
             }
-            
-            // Handle delayed server restart after secret change
-            if (pendingSecret != null && 
-                EditorApplication.timeSinceStartup - secretChangeTime > SECRET_RESTART_DELAY)
+
+            // Trigger auto-start if enabled but server not running
+            bool isRunning = ServerEditor.IsRunning();
+
+            if (config.editorAutoStart && !isRunning)
             {
-                bool wasRunning = EditorMCPServer.IsRunning();
-                
-                if (wasRunning)
-                {
-                    EditorMCPServer.Stop();
-                }
-                
-                if (autoStart)
-                {
-                    EditorMCPServer.Start();
-                }
-                
-                pendingSecret = null;
+                ServerEditor.Start();
             }
         }
 

@@ -1,7 +1,7 @@
 {
   "name": "AironMCP.Editor",
   "rootNamespace": "Airon.MCP",
-  "references": [],
+  "references": ["AironMCP.Runtime"],
   "includePlatforms": ["Editor"],
   "excludePlatforms": [],
   "overrideReferences": true,

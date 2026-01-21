@@ -596,12 +596,12 @@ app.get('/health', (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 
-async function start() {
+export async function startRelay() {
   authorizedNodes = await loadAuthorizedNodes();
-  
-  server.listen(PORT, () => { 
+
+  server.listen(PORT, () => {
     console.log('AIRON Relay started on port ' + PORT);
-    
+
     if (authorizedNodes === null) {
       console.log('⚠️  ERROR: No airon-nodes.json found and AIRON_ADMIN_NODE not set.');
       console.log('⚠️  Server will reject all connections. Set AIRON_ADMIN_NODE environment variable.');
@@ -611,4 +611,8 @@ async function start() {
   });
 }
 
-start();
+// Run directly if this is the entry point
+const isMain = import.meta.url === `file://${process.argv[1].replace(/\\/g, '/')}`;
+if (isMain) {
+  startRelay();
+}

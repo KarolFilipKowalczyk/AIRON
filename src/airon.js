@@ -1,12 +1,19 @@
 #!/usr/bin/env node
 /**
- * airon.js - AIRON Node Client
- * 
+ * airon.js - AIRON (AI Remote Operations Node)
+ *
  * Copyright (c) 2025 Karol Kowalczyk
  * Licensed under the MIT License
  * See: https://opensource.org/licenses/MIT
- * 
- * Usage: airon <relay-url> [-u|--user <username>] [-s|--secret <secret>] [-e|--editor-port <port>] [-g|--game-port <port>] [-p|--path <working-dir>]
+ *
+ * Unified entry point for AIRON - can run as node client, relay server, or bridge.
+ *
+ * Usage:
+ *   airon [options] [relay-url]           Node mode (default) - connect to relay
+ *   airon -m relay                        Relay mode - run as relay server
+ *   airon -m bridge [--editor|--game|--both]  Bridge mode - stdio MCP bridge
+ *
+ * Run 'airon --help' for full options.
  */
 
 import WebSocket from 'ws';
@@ -16,6 +23,10 @@ import { resolve, relative, join } from 'path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from 'fs';
 import { randomUUID } from 'crypto';
 import readline from 'readline';
+
+// Static imports for all modes (required for SEA bundle)
+import { startRelay } from './airon-relay.js';
+import { startBridge } from './airon-bridge.js';
 
 let WORKING_DIR = process.cwd(); // Default: where airon.js was launched, can be overridden by -p/--path
 
@@ -171,38 +182,54 @@ function spawnClaudeCode(args, sessionId, sessionData) {
 // Parse command line arguments
 function parseArgs() {
   const args = process.argv.slice(2);
-  const parsed = { relay: args[0] }; // First unnamed arg is relay
-  
+  const parsed = {};
+
   // Map of short args to long args
   const argAliases = {
+    'h': 'help',
+    'm': 'mode',
     'u': 'user',
     's': 'secret',
     'e': 'editor-port',
     'g': 'game-port',
     'p': 'path'
   };
-  
-  for (let i = 1; i < args.length; i++) {
+
+  // Boolean flags (no value needed)
+  const booleanFlags = ['help', 'h'];
+
+  for (let i = 0; i < args.length; i++) {
     if (args[i].startsWith('--')) {
-      // Long argument (e.g., --port)
+      // Long argument (e.g., --mode)
       const key = args[i].substring(2);
-      const value = args[i + 1];
-      if (value && !value.startsWith('-')) {
-        parsed[key] = value;
-        i++; // Skip next arg since we consumed it
+      if (booleanFlags.includes(key)) {
+        parsed[key] = true;
+      } else {
+        const value = args[i + 1];
+        if (value && !value.startsWith('-')) {
+          parsed[key] = value;
+          i++; // Skip next arg since we consumed it
+        }
       }
     } else if (args[i].startsWith('-')) {
-      // Short argument (e.g., -p)
+      // Short argument (e.g., -m)
       const shortKey = args[i].substring(1);
       const longKey = argAliases[shortKey] || shortKey;
-      const value = args[i + 1];
-      if (value && !value.startsWith('-')) {
-        parsed[longKey] = value;
-        i++; // Skip next arg since we consumed it
+      if (booleanFlags.includes(shortKey)) {
+        parsed[longKey] = true;
+      } else {
+        const value = args[i + 1];
+        if (value && !value.startsWith('-')) {
+          parsed[longKey] = value;
+          i++; // Skip next arg since we consumed it
+        }
       }
+    } else if (!parsed.relay) {
+      // First non-flag argument is relay URL (only for node mode)
+      parsed.relay = args[i];
     }
   }
-  
+
   return parsed;
 }
 
@@ -257,22 +284,66 @@ const args = parseArgs();
 
 // Handle --help flag
 if (args.help || args.h) {
-  console.log('\n  AIRON Node Client - Remote Unity Development via Claude.ai\n');
-  console.log('  Usage: airon <relay-url> [options]\n');
-  console.log('  Options:');
+  console.log('\n  AIRON - AI Remote Operations Node\n');
+  console.log('  Usage: airon [options] [relay-url]\n');
+  console.log('  Modes:');
+  console.log('    -m, --mode <mode>          Operating mode: node (default), relay, or bridge');
+  console.log('');
+  console.log('  Node Mode (default) - Connect to relay server:');
+  console.log('    airon <relay-url> [options]');
   console.log('    -u, --user <username>      Username for authentication');
   console.log('    -s, --secret <secret>      Secret token (min 16 chars)');
   console.log('    -e, --editor-port <port>   Unity Editor MCP port (default: 3002)');
   console.log('    -g, --game-port <port>     Unity Game MCP port (default: 3003)');
   console.log('    -p, --path <directory>     Working directory (default: current)');
-  console.log('    -h, --help                 Show this help message\n');
+  console.log('');
+  console.log('  Relay Mode - Run as relay server:');
+  console.log('    airon -m relay');
+  console.log('    Environment variables:');
+  console.log('      PORT                     Server port (default: 3001)');
+  console.log('      AIRON_DATA_DIR           Directory for airon-nodes.json (default: .)');
+  console.log('      AIRON_ADMIN_NODE         Initial admin token (username:secret)');
+  console.log('');
+  console.log('  Bridge Mode - Stdio MCP bridge for Unity:');
+  console.log('    airon -m bridge [--editor|--game|--both]');
+  console.log('    --editor                   Bridge to Unity Editor MCP (port 3002, default)');
+  console.log('    --game                     Bridge to Unity Game MCP (port 3003)');
+  console.log('    --both                     Bridge to both Editor and Game MCP');
+  console.log('');
+  console.log('  General:');
+  console.log('    -h, --help                 Show this help message');
+  console.log('');
   console.log('  Examples:');
   console.log('    airon https://dev.airon.games/mcp');
   console.log('    airon https://relay.example.com/mcp -u myuser -s my-secret-token');
-  console.log('    airon https://relay.example.com/mcp -u myuser -s token -p ~/MyProject');
-  console.log('    airon https://relay.example.com/mcp -u myuser -s token -e 4002 -g 4003\n');
+  console.log('    airon -m relay');
+  console.log('    airon -m bridge --editor');
+  console.log('    airon -m bridge --both\n');
   process.exit(0);
 }
+
+// Mode routing - determine which mode to run
+const runMode = args.mode || 'node';
+
+if (runMode === 'relay') {
+  startRelay();
+} else if (runMode === 'bridge') {
+  // Determine bridge sub-mode from args
+  let bridgeMode = 'editor';
+  if (process.argv.includes('--game')) bridgeMode = 'game';
+  else if (process.argv.includes('--both')) bridgeMode = 'both';
+  startBridge(bridgeMode);
+} else if (runMode !== 'node') {
+  console.error(`\n  ❌ Unknown mode: ${runMode}`);
+  console.error('  Valid modes: node, relay, bridge\n');
+  process.exit(1);
+} else {
+  // Node mode - run the node client
+  runNodeMode();
+}
+
+// Node mode code wrapped in function to prevent execution in relay/bridge modes
+function runNodeMode() {
 
 // Handle working directory override
 if (args.path) {
@@ -1805,3 +1876,5 @@ main().catch(err => {
   console.error('Fatal error:', err);
   process.exit(1);
 });
+
+} // End of runNodeMode()

@@ -31,16 +31,19 @@ const CONFIG = {
     }
 };
 
-// Parse command line arguments
-const args = process.argv.slice(2);
+// Bridge mode - can be set via parameter or command line
 let mode = 'editor'; // default
 
-if (args.includes('--game')) {
-    mode = 'game';
-} else if (args.includes('--both')) {
-    mode = 'both';
-} else if (args.includes('--editor')) {
-    mode = 'editor';
+function parseBridgeArgs() {
+    const args = process.argv.slice(2);
+    if (args.includes('--game')) {
+        return 'game';
+    } else if (args.includes('--both')) {
+        return 'both';
+    } else if (args.includes('--editor')) {
+        return 'editor';
+    }
+    return 'editor';
 }
 
 // Server info based on mode
@@ -379,9 +382,14 @@ function sendResponse(response) {
 }
 
 /**
- * Main entry point
+ * Main entry point - exported for use from airon.js
+ * @param {string} bridgeMode - 'editor', 'game', or 'both'
  */
-async function main() {
+export async function startBridge(bridgeMode) {
+    // Set mode and update serverInfo
+    mode = bridgeMode || parseBridgeArgs();
+    serverInfo.name = mode === 'both' ? 'airon-bridge' : CONFIG[mode].name;
+
     // Set up readline for stdin
     const rl = readline.createInterface({
         input: process.stdin,
@@ -430,4 +438,8 @@ async function main() {
     process.on('SIGTERM', () => process.exit(0));
 }
 
-main();
+// Run directly if this is the entry point
+const isMain = import.meta.url === `file://${process.argv[1].replace(/\\/g, '/')}`;
+if (isMain) {
+    startBridge();
+}

@@ -10,8 +10,9 @@
   "scripts": {
     "start": "node src/airon.js",
     "relay": "node src/airon-relay.js",
+    "bridge": "node src/airon.js -m bridge",
     "bundle": "esbuild src/airon.js --bundle --platform=node --format=cjs --outfile=dist/airon-bundled.cjs",
-    "build": "npm run bundle && node build-sea.js"
+    "build": "node build-sea.js"
   },
   "keywords": [
     "unity",

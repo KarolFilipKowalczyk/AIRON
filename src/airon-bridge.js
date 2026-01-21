@@ -16,6 +16,7 @@
 
 import http from 'http';
 import readline from 'readline';
+import { pathToFileURL } from 'url';
 
 // Configuration
 const CONFIG = {
@@ -439,7 +440,7 @@ export async function startBridge(bridgeMode) {
 }
 
 // Run directly if this is the entry point
-const isMain = import.meta.url === `file://${process.argv[1].replace(/\\/g, '/')}`;
+const isMain = import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
     startBridge();
 }

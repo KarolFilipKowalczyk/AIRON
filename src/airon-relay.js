@@ -14,6 +14,7 @@ import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 import crypto from 'crypto';
 import { readFile, writeFile, access } from 'fs/promises';
+import { pathToFileURL } from 'url';
 
 const app = express();
 const server = createServer(app);
@@ -612,7 +613,7 @@ export async function startRelay() {
 }
 
 // Run directly if this is the entry point
-const isMain = import.meta.url === `file://${process.argv[1].replace(/\\/g, '/')}`;
+const isMain = import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
   startRelay();
 }

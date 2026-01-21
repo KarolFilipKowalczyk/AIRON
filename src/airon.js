@@ -314,7 +314,6 @@ if (args.help || args.h) {
   console.log('    -h, --help                 Show this help message');
   console.log('');
   console.log('  Examples:');
-  console.log('    airon https://dev.airon.games/mcp');
   console.log('    airon https://relay.example.com/mcp -u myuser -s my-secret-token');
   console.log('    airon -m relay');
   console.log('    airon -m bridge --editor');

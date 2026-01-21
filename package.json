@@ -1,6 +1,6 @@
 {
   "name": "airon",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Artificial Intelligence Remote Operations Node - Control Unity remotely via Claude.ai MCP",
   "main": "src/airon.js",

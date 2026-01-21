@@ -433,7 +433,7 @@ See the main AIRON documentation for complete remote system setup.
 
 ## Version
 
-- **Version**: 0.2.0-alpha
+- **Version**: 0.2.1-alpha
 - **Unity Version**: 2021.3+
 - **MCP Protocol**: 2024-11-05
 - **Transport**: Streamable HTTP (MCP spec 2025-03-26)

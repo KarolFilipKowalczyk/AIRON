@@ -4,14 +4,15 @@
 
 Control Unity Editor remotely through Claude.ai or locally through Claude Code.
 
-**Version: 0.2.0-alpha**
+**Version: 0.2.1-alpha**
 
 ## Overview
 
-AIRON enables AI-driven Unity development workflows by connecting Claude to Unity through MCP (Model Context Protocol). It supports two modes:
+AIRON enables AI-driven Unity development workflows by connecting Claude to Unity through MCP (Model Context Protocol). All functionality is bundled in a single executable (`airon.exe` or `node airon.js`) with three operating modes:
 
-1. **Local Mode** - Claude Code connects directly to Unity MCP servers via `airon-bridge.js`
-2. **Remote Mode** - Claude.ai connects to Unity through a relay server and node client
+1. **Node Mode** (default) - Connect to a relay server for remote access via Claude.ai
+2. **Relay Mode** (`-m relay`) - Run as the central relay server
+3. **Bridge Mode** (`-m bridge`) - Stdio MCP bridge for local Claude Code integration
 
 ## Repository Structure
 
@@ -22,16 +23,19 @@ airon/
 ├── .gitignore
 ├── package.json
 ├── package-lock.json
-├── airon.js              # Node client (remote mode)
-├── airon-relay.js        # Relay server (remote mode)
-├── airon-bridge.js       # Stdio bridge (local mode)
-└── Packages/
-    └── com.airon.mcp/    # Unity package
-        ├── Editor/
-        ├── Runtime/
-        ├── package.json
-        ├── LICENSE.txt
-        └── README.md
+├── build-sea.js          # Build script for standalone executable
+├── src/
+│   ├── airon.js          # Main entry point (all modes)
+│   ├── airon-relay.js    # Relay server module
+│   ├── airon-bridge.js   # Bridge module
+│   └── com.airon.mcp/    # Unity package
+│       ├── Editor/
+│       ├── Runtime/
+│       ├── package.json
+│       ├── LICENSE.txt
+│       └── README.md
+└── dist/
+    └── airon.exe         # Standalone Windows executable
 ```
 
 ## Quick Start
@@ -42,7 +46,7 @@ Best for local development with Claude Code CLI.
 
 **1. Install Unity Package**
 
-Copy `Packages/com.airon.mcp/` to your Unity project's Packages folder.
+Copy `src/com.airon.mcp/` to your Unity project's Packages folder.
 
 **2. Add MCP Servers to Claude Code**
 
@@ -50,6 +54,10 @@ Copy `Packages/com.airon.mcp/` to your Unity project's Packages folder.
 # Direct HTTP connection (recommended)
 claude mcp add unity-editor --transport http http://localhost:3002/mcp
 claude mcp add unity-game --transport http http://localhost:3003/mcp
+
+# Or use AIRON bridge (alternative - supports auto-retry)
+claude mcp add unity-editor airon.exe -- -m bridge --editor
+claude mcp add unity-game airon.exe -- -m bridge --game
 ```
 
 **3. Start Using**
@@ -62,20 +70,28 @@ Best for mobile access or Claude.ai web interface.
 
 **1. Deploy Relay Server**
 
-See [Relay Server Setup](#relay-server-setup) below.
+```bash
+# Using the executable
+airon.exe -m relay
+
+# Or from source
+node src/airon.js -m relay
+```
+
+See [Relay Server Setup](#relay-server-setup) for production deployment.
 
 **2. Install Unity Package**
 
-Copy `Packages/com.airon.mcp/` to your Unity project's Packages folder.
+Copy `src/com.airon.mcp/` to your Unity project's Packages folder.
 
 **3. Run Node Client**
 
 ```bash
-# Binary release (Windows)
+# Using the executable
 airon.exe https://relay.example.com/mcp -u yourname -s yoursecret
 
-# From source
-node airon.js https://relay.example.com/mcp -u yourname -s yoursecret
+# Or from source
+node src/airon.js https://relay.example.com/mcp -u yourname -s yoursecret
 ```
 
 **4. Configure Claude.ai MCP Connector**
@@ -83,38 +99,55 @@ node airon.js https://relay.example.com/mcp -u yourname -s yoursecret
 In Claude.ai: Settings → Connectors → Add Custom Connector
 - **URL**: `https://relay.example.com/mcp/yourname/yoursecret`
 
-## Node Client (airon.js)
+## Command Line Usage
 
-Interactive client connecting local Unity to the relay server.
+All functionality is accessed through a single executable with different modes.
 
 ### Usage
 
 ```bash
-airon <relay-url> [options]
+airon [options] [relay-url]
 
-Options:
+Modes:
+  -m, --mode <mode>          Operating mode: node (default), relay, or bridge
+
+Node Mode (default) - Connect to relay server:
+  airon <relay-url> [options]
   -u, --user <username>      Username for authentication
   -s, --secret <secret>      Secret token (min 16 chars)
   -e, --editor-port <port>   Unity Editor MCP port (default: 3002)
   -g, --game-port <port>     Unity Game MCP port (default: 3003)
   -p, --path <directory>     Working directory (default: current)
+
+Relay Mode - Run as relay server:
+  airon -m relay
+  Environment variables:
+    PORT                     Server port (default: 3001)
+    AIRON_DATA_DIR           Directory for airon-nodes.json (default: .)
+    AIRON_ADMIN_NODE         Initial admin token (username:secret)
+
+Bridge Mode - Stdio MCP bridge for Unity:
+  airon -m bridge [--editor|--game|--both]
+  --editor                   Bridge to Unity Editor MCP (port 3002, default)
+  --game                     Bridge to Unity Game MCP (port 3003)
+  --both                     Bridge to both Editor and Game MCP
+
+General:
   -h, --help                 Show help message
 ```
 
 ### Examples
 
 ```bash
-# Connect with credentials
-airon https://dev.airon.games/mcp -u myuser -s mysecrettoken123
+# Node mode - connect to relay
+airon https://relay.example.com/mcp -u myuser -s my-secret-token
 
-# With custom ports
-airon https://dev.airon.games/mcp -u myuser -s token -e 4002 -g 4003
+# Relay mode - start server
+airon -m relay
 
-# With working directory
-airon https://dev.airon.games/mcp -u myuser -s token -p ~/MyProject
-
-# Interactive prompt for credentials
-airon https://dev.airon.games/mcp
+# Bridge mode - stdio MCP for Claude Code
+airon -m bridge --editor
+airon -m bridge --both
 ```
 
 ### Interactive Commands
@@ -136,7 +169,7 @@ help                       - Show help
 exit                       - Exit AIRON
 ```
 
-## Stdio Bridge (airon-bridge.js) - Optional
+## Bridge Mode
 
 Alternative to direct HTTP connection. Wraps Unity's HTTP MCP servers as stdio transport.
 
@@ -148,9 +181,9 @@ Alternative to direct HTTP connection. Wraps Unity's HTTP MCP servers as stdio t
 
 ```bash
 # Add via Claude Code (alternative to direct HTTP)
-claude mcp add unity-editor node /path/to/airon-bridge.js -- --editor
-claude mcp add unity-game node /path/to/airon-bridge.js -- --game
-claude mcp add unity node /path/to/airon-bridge.js -- --both
+claude mcp add unity-editor airon.exe -- -m bridge --editor
+claude mcp add unity-game airon.exe -- -m bridge --game
+claude mcp add unity airon.exe -- -m bridge --both
 ```
 
 ### Modes
@@ -169,11 +202,21 @@ claude mcp add unity node /path/to/airon-bridge.js -- --both
 
 **Note:** For most use cases, direct HTTP connection is simpler and recommended.
 
-## Relay Server (airon-relay.js)
+## Relay Mode
 
 Central server for remote access. Handles authentication and message routing.
 
-### Relay Server Setup
+### Quick Start
+
+```bash
+# Start relay server locally
+airon -m relay
+
+# Or with environment variables
+PORT=3001 AIRON_ADMIN_NODE=admin:mysecrettoken airon -m relay
+```
+
+### Production Deployment with Docker
 
 **1. Create docker-compose.yml**
 
@@ -182,12 +225,13 @@ version: '3.8'
 
 services:
   airon-relay:
-    image: node:18-alpine
+    image: node:20-alpine
     container_name: airon-relay
     restart: unless-stopped
     working_dir: /app
     volumes:
-      - ./airon-relay.js:/app/airon-relay.js
+      - ./src/airon.js:/app/airon.js
+      - ./src/airon-relay.js:/app/airon-relay.js
       - ./node_modules:/app/node_modules
       - ./data:/app/data
     ports:
@@ -196,7 +240,7 @@ services:
       - PORT=3001
       - AIRON_DATA_DIR=/app/data
       - AIRON_ADMIN_NODE=adminuser:youradminsecrethere
-    command: node airon-relay.js
+    command: node airon.js -m relay
 ```
 
 **2. Deploy**
@@ -297,7 +341,7 @@ MCP servers for Unity Editor and Game runtime.
 | `status` | Get runtime state |
 | `viewlog` | View game logs |
 
-See `Packages/com.airon.mcp/README.md` for custom tool creation.
+See `src/com.airon.mcp/README.md` for custom tool creation.
 
 ## Available Tools (Remote Mode)
 
@@ -353,14 +397,21 @@ mcp__unity-editor__viewlog
 npm install
 
 # Run directly
-node airon.js https://relay.example.com/mcp -u user -s secret
+node src/airon.js https://relay.example.com/mcp -u user -s secret
+node src/airon.js -m relay
+node src/airon.js -m bridge --editor
+
+# Build standalone executable (Windows)
+npm run build
+# Output: dist/airon.exe
 ```
 
 ## Requirements
 
-- **Node.js**: 18+ (uses native fetch)
+- **Node.js**: 20+ (required for SEA build)
 - **Unity**: 2021.3+
 - **Claude Code**: Latest version (for local mode)
+- **Windows**: Standalone executable only (or run via Node.js on other platforms)
 
 ## License
 

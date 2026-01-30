@@ -46,7 +46,12 @@ namespace AIRON.MCP
                     break;
                 case PlayModeStateChange.EnteredEditMode:
                     // Restart dummy server after exiting play mode
-                    Start();
+                    // Use delayed start to ensure the real server's port is fully released
+                    EditorApplication.delayCall += () =>
+                    {
+                        // Add small delay for socket TIME_WAIT to clear
+                        EditorApplication.delayCall += Start;
+                    };
                     break;
             }
         }
@@ -127,7 +132,8 @@ namespace AIRON.MCP
                     return JsonConvert.SerializeObject(new
                     {
                         running = false,
-                        message = "Not in Play Mode"
+                        message = "Not in Play Mode",
+                        serverStartTime = _serverStartTime.ToString("o")
                     });
                 }
 

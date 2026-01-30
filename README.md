@@ -4,7 +4,7 @@
 
 Control Unity Editor remotely through Claude.ai or locally through Claude Code.
 
-**Version: 0.2.1-alpha**
+**Version: 0.9.0-beta**
 
 ## Overview
 
@@ -19,7 +19,7 @@ AIRON enables AI-driven Unity development workflows by connecting Claude to Unit
 ```
 airon/
 ├── README.md
-├── LICENSE.txt
+├── LICENSE
 ├── .gitignore
 ├── package.json
 ├── package-lock.json
@@ -87,17 +87,20 @@ Copy `src/com.airon.mcp/` to your Unity project's Packages folder.
 **3. Run Node Client**
 
 ```bash
-# Using the executable
-airon.exe https://relay.example.com/mcp -u yourname -s yoursecret
+# Using the executable (opens browser for OAuth login)
+airon.exe https://relay.example.com --client-id <id>
 
 # Or from source
-node src/airon.js https://relay.example.com/mcp -u yourname -s yoursecret
+node src/airon.js https://relay.example.com --client-id <id>
 ```
+
+The node client will open your browser for OAuth login (Google by default). Credentials are cached in `~/.airon/credentials.json` and refreshed automatically.
 
 **4. Configure Claude.ai MCP Connector**
 
 In Claude.ai: Settings → Connectors → Add Custom Connector
-- **URL**: `https://relay.example.com/mcp/yourname/yoursecret`
+- **URL**: `https://relay.example.com/mcp`
+- Claude.ai will be redirected through the OAuth flow to authenticate
 
 ## Command Line Usage
 
@@ -112,9 +115,10 @@ Modes:
   -m, --mode <mode>          Operating mode: node (default), relay, or bridge
 
 Node Mode (default) - Connect to relay server:
-  airon <relay-url> [options]
-  -u, --user <username>      Username for authentication
-  -s, --secret <secret>      Secret token (min 16 chars)
+  airon [relay-url] [options]
+  --issuer <url>             OIDC issuer URL (default: https://accounts.google.com)
+  --client-id <id>           OAuth Client ID
+  --client-secret <secret>   OAuth Client Secret (for token refresh)
   -e, --editor-port <port>   Unity Editor MCP port (default: 3002)
   -g, --game-port <port>     Unity Game MCP port (default: 3003)
   -p, --path <directory>     Working directory (default: current)
@@ -123,14 +127,15 @@ Relay Mode - Run as relay server:
   airon -m relay
   Environment variables:
     PORT                     Server port (default: 3001)
-    AIRON_DATA_DIR           Directory for airon-nodes.json (default: .)
-    AIRON_ADMIN_NODE         Initial admin token (username:secret)
+    AIRON_OIDC_ISSUER        OIDC issuer URL (default: https://accounts.google.com)
+    AIRON_OIDC_CLIENT_ID     OAuth Client ID
+    AIRON_OIDC_CLIENT_SECRET OAuth Client Secret
+    AIRON_BASE_URL           Public base URL of the relay
 
-Bridge Mode - Stdio MCP bridge for Unity:
-  airon -m bridge [--editor|--game|--both]
-  --editor                   Bridge to Unity Editor MCP (port 3002, default)
-  --game                     Bridge to Unity Game MCP (port 3003)
-  --both                     Bridge to both Editor and Game MCP
+Bridge Mode - Stdio MCP bridge:
+  airon -m bridge [port]               Generic MCP on specified port
+  airon -m bridge --editor [port]      Unity Editor MCP (default: 3002)
+  airon -m bridge --game [port]        Unity Game MCP (default: 3003)
 
 General:
   -h, --help                 Show help message
@@ -139,15 +144,16 @@ General:
 ### Examples
 
 ```bash
-# Node mode - connect to relay
-airon https://relay.example.com/mcp -u myuser -s my-secret-token
+# Node mode - connect to relay (opens browser for OAuth login)
+airon --client-id <id>
+airon https://custom-relay.com --client-id <id>
 
 # Relay mode - start server
 airon -m relay
 
 # Bridge mode - stdio MCP for Claude Code
 airon -m bridge --editor
-airon -m bridge --both
+airon -m bridge --game
 ```
 
 ### Interactive Commands
@@ -156,7 +162,7 @@ Once connected, use these commands in the terminal:
 
 ```
 status                     - Check Unity and MCP server status
-claude-code <description>  - Run Claude Code task (interactive mode)
+claude-code <description>  - Run Claude Code task
 claude-continue [input]    - Continue session with input
 claude-force               - Execute with full permissions
 claude-sessions            - List active Claude Code sessions
@@ -164,7 +170,6 @@ claude-abort               - Abort current running task
 unity-editor <tool> [args] - Call Unity Editor MCP tool
 unity-game <tool> [args]   - Call Unity Game MCP tool
 unity-tools                - List all available Unity MCP tools
-admin <subcommand>         - Admin commands (if admin node)
 help                       - Show help
 exit                       - Exit AIRON
 ```
@@ -183,7 +188,6 @@ Alternative to direct HTTP connection. Wraps Unity's HTTP MCP servers as stdio t
 # Add via Claude Code (alternative to direct HTTP)
 claude mcp add unity-editor airon.exe -- -m bridge --editor
 claude mcp add unity-game airon.exe -- -m bridge --game
-claude mcp add unity airon.exe -- -m bridge --both
 ```
 
 ### Modes
@@ -192,7 +196,6 @@ claude mcp add unity airon.exe -- -m bridge --both
 |------|-------------|------------|
 | `--editor` | Editor MCP only (default) | `play`, `status`, etc. |
 | `--game` | Game MCP only | `status`, `viewlog`, etc. |
-| `--both` | Both servers | `editor:play`, `game:status` |
 
 ### Features
 
@@ -213,7 +216,7 @@ Central server for remote access. Handles authentication and message routing.
 airon -m relay
 
 # Or with environment variables
-PORT=3001 AIRON_ADMIN_NODE=admin:mysecrettoken airon -m relay
+AIRON_OIDC_CLIENT_ID=your-client-id AIRON_OIDC_CLIENT_SECRET=your-secret airon -m relay
 ```
 
 ### Production Deployment with Docker
@@ -233,13 +236,14 @@ services:
       - ./src/airon.js:/app/airon.js
       - ./src/airon-relay.js:/app/airon-relay.js
       - ./node_modules:/app/node_modules
-      - ./data:/app/data
     ports:
       - "3001:3001"
     environment:
       - PORT=3001
-      - AIRON_DATA_DIR=/app/data
-      - AIRON_ADMIN_NODE=adminuser:youradminsecrethere
+      - AIRON_OIDC_ISSUER=https://accounts.google.com
+      - AIRON_OIDC_CLIENT_ID=your-google-client-id
+      - AIRON_OIDC_CLIENT_SECRET=your-google-client-secret
+      - AIRON_BASE_URL=https://relay.example.com
     command: node airon.js -m relay
 ```
 
@@ -250,7 +254,7 @@ mkdir airon-relay && cd airon-relay
 # Copy docker-compose.yml and airon-relay.js
 
 # Install dependencies
-docker run --rm -v $(pwd):/app -w /app node:18-alpine npm install ws express
+docker run --rm -v $(pwd):/app -w /app node:20-alpine npm install
 
 # Start relay
 docker-compose up -d
@@ -292,25 +296,12 @@ relay.example.com {
 
 ### Security Features
 
-- **Token validation**: Minimum 16 character secrets
-- **Timing-safe comparison**: Prevents timing attacks
+- **OAuth 2.0 / OIDC authentication**: Provider-agnostic (Google by default)
+- **JWT verification**: ID tokens verified against OIDC issuer's JWKS
+- **Automatic token refresh**: Tokens refreshed before expiry
 - **Rate limiting**: 100 requests per 15 minutes per IP
-- **Connection limits**: Max 10 connections per IP, 1000 total SSE clients
-- **Idle timeout**: SSE sessions timeout after 5 minutes
-- **Authorized nodes file**: `airon-nodes.json` whitelist
-
-### Admin Commands
-
-Admin nodes can manage users via the interactive CLI:
-
-```bash
-admin user-list                         # List all nodes
-admin user-add <username> <secret>      # Add node
-admin user-add <username> <secret> --admin  # Add admin node
-admin user-delete <username> <secret>   # Remove node
-```
-
-MCP connector URL format: `https://relay.example.com/mcp/<username>/<secret>`
+- **Connection limits**: Max 1000 total SSE clients
+- **Session expiry**: Claude sessions expire after 7 days
 
 ## Unity Package (com.airon.mcp)
 
@@ -319,7 +310,7 @@ MCP servers for Unity Editor and Game runtime.
 ### Features
 
 - **Streamable HTTP transport** (MCP spec 2025-03-26)
-- **File-based configuration** (`ProjectSettings/AironMcpConfig.json`)
+- **File-based configuration** (`ProjectSettings/Packages/com.airon.mcp/Settings.json`)
 - **SSE notifications** for real-time events
 - **Custom tools** via reflection
 - **Localhost only** for security
@@ -397,7 +388,7 @@ mcp__unity-editor__viewlog
 npm install
 
 # Run directly
-node src/airon.js https://relay.example.com/mcp -u user -s secret
+node src/airon.js --client-id <id>
 node src/airon.js -m relay
 node src/airon.js -m bridge --editor
 
@@ -412,6 +403,13 @@ npm run build
 - **Unity**: 2021.3+
 - **Claude Code**: Latest version (for local mode)
 - **Windows**: Standalone executable only (or run via Node.js on other platforms)
+
+## Known Issues
+
+- Server version strings in `airon-relay.js`, `airon-bridge.js`, and `Constants.cs` are hardcoded as `"1.0.0"` instead of `"0.9.0-beta"`
+- `--help` output for relay mode does not list `AIRON_OIDC_CLIENT_SECRET` and `AIRON_BASE_URL` environment variables
+- Relay tool description for `unity-game` mentions a nonexistent `execute` tool
+- `ControlWindow.cs` example references `GetCurrentScene` method which does not exist (should be `GetLoadedScenes`)
 
 ## License
 

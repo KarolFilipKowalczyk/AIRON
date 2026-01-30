@@ -17,9 +17,12 @@ namespace AIRON.MCP
     [InitializeOnLoad]
     public static class ServerEditor
     {
-
         // Server implementation (uses shared base class)
         private static ServerEditorImpl _serverImpl;
+
+        // Track if start has been attempted this session to prevent spam
+        private static bool _startAttempted;
+        private static bool _startFailed;
 
         /// <summary>
         /// Gets the SSE connection manager for broadcasting events to connected clients.
@@ -39,6 +42,10 @@ namespace AIRON.MCP
 
         static ServerEditor()
         {
+            EditorApplication.update += ProcessMainThreadQueue;
+            EditorApplication.quitting += Stop;
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+
             // Load configuration
             var config = ConfigManager.LoadConfig();
 
@@ -47,21 +54,41 @@ namespace AIRON.MCP
 
             if (autoStart)
             {
-                Start();
+                // Delay start to allow previous server socket to be released after assembly reload
+                EditorApplication.delayCall += DelayedStart;
             }
             else
             {
                 Debug.Log("[AIRON] Editor MCP auto-start is disabled");
             }
-
-            EditorApplication.update += ProcessMainThreadQueue;
-            EditorApplication.quitting += Stop;
-            AssemblyReloadEvents.beforeAssemblyReload += Stop;
         }
+
+        private static void OnBeforeAssemblyReload()
+        {
+            // Reset flags for next session
+            _startAttempted = false;
+            _startFailed = false;
+            Stop();
+        }
+
+        private static void DelayedStart()
+        {
+            // Additional safety delay to ensure socket is released
+            EditorApplication.delayCall += Start;
+        }
+
 
         public static void Start()
         {
+            // Prevent repeated start attempts after failure
+            if (_startFailed)
+            {
+                return;
+            }
+
             if (_serverImpl != null && _serverImpl.IsRunning()) return;
+
+            _startAttempted = true;
 
             // Load configuration
             var config = ConfigManager.LoadConfig();
@@ -73,7 +100,12 @@ namespace AIRON.MCP
             // Load custom tools
             _serverImpl.LoadEditorTools(config?.editorTools);
 
-            _serverImpl.Start();
+            if (!_serverImpl.Start())
+            {
+                _startFailed = true;
+                _serverImpl = null;
+                Debug.LogWarning("[AIRON] Editor MCP server failed to start. Use AIRON > Restart Editor MCP Server menu to retry, or restart Unity.");
+            }
         }
 
         public static void Stop()
@@ -128,9 +160,9 @@ namespace AIRON.MCP
                 _mainThread = Thread.CurrentThread;
             }
 
-            public void Start()
+            public bool Start()
             {
-                StartServer();
+                return StartServer();
             }
 
             public void Stop()

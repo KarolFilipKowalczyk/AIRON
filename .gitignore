@@ -12,6 +12,9 @@ config.json
 airon-nodes.json
 data/
 
+# Claude
+.claude/
+
 # IDE
 .vscode/
 .idea/

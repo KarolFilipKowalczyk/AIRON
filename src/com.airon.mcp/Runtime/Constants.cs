@@ -46,6 +46,12 @@ namespace AIRON.MCP
         /// <summary>Interval between SSE keepalive messages in seconds.</summary>
         public const int SSEKeepAliveIntervalSeconds = 15;
 
+        /// <summary>Maximum number of retry attempts when starting server with port conflict.</summary>
+        public const int ServerStartMaxRetries = 3;
+
+        /// <summary>Delay between server start retry attempts in milliseconds.</summary>
+        public const int ServerStartRetryDelayMs = 1000;
+
         #endregion
 
         #region Limits

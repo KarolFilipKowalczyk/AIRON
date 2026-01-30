@@ -92,33 +92,67 @@ namespace AIRON.MCP
         /// Starts the MCP server using Streamable HTTP transport.
         /// Single endpoint at /mcp supporting POST and GET (SSE).
         /// Always binds to localhost only for security.
+        /// Includes retry logic to handle port conflicts during server switching.
         /// </summary>
-        protected void StartServer()
+        /// <returns>True if server started successfully, false otherwise.</returns>
+        protected bool StartServer()
         {
-            if (_running) return;
+            if (_running) return true;
 
-            try
+            _serverStartTime = DateTime.UtcNow;
+            _executor = new MainThreadExecutor(ServerName);
+            _sseManager = new SSEConnectionManager(ServerName);
+
+            // Retry loop to handle port conflicts when switching between servers
+            for (int attempt = 1; attempt <= Constants.ServerStartMaxRetries; attempt++)
             {
-                _serverStartTime = DateTime.UtcNow;
-                _executor = new MainThreadExecutor(ServerName);
-                _sseManager = new SSEConnectionManager(ServerName);
+                try
+                {
+                    // Start HTTP listener - single endpoint for Streamable HTTP
+                    // Always bind to localhost only for security
+                    _listener = new HttpListener();
+                    _listener.Prefixes.Add($"http://localhost:{_port}/");
+                    _listener.Start();
+                    _running = true;
 
-                // Start HTTP listener - single endpoint for Streamable HTTP
-                // Always bind to localhost only for security
-                _listener = new HttpListener();
-                _listener.Prefixes.Add($"http://localhost:{_port}/");
-                _listener.Start();
-                _running = true;
+                    _listenerThread = new Thread(ListenLoop) { IsBackground = true };
+                    _listenerThread.Start();
 
-                _listenerThread = new Thread(ListenLoop) { IsBackground = true };
-                _listenerThread.Start();
+                    Logger.LogServerEvent(ServerName, "started", _port, "Streamable HTTP, localhost only");
+                    return true; // Success
+                }
+                catch (Exception e) when (IsAddressInUseException(e))
+                {
+                    // Address already in use - retry after delay
+                    // Clean up failed listener
+                    try { _listener?.Close(); } catch { }
+                    _listener = null;
 
-                Logger.LogServerEvent(ServerName, "started", _port, "Streamable HTTP, localhost only");
+                    if (attempt < Constants.ServerStartMaxRetries)
+                    {
+                        Logger.LogDebug($"{ServerName} port {_port} in use, retrying ({attempt}/{Constants.ServerStartMaxRetries})...");
+                        Thread.Sleep(Constants.ServerStartRetryDelayMs);
+                    }
+                    else
+                    {
+                        Logger.LogError($"Failed to start {ServerName} MCP server after {Constants.ServerStartMaxRetries} attempts: {e.Message}");
+                        _executor = null;
+                        _sseManager = null;
+                    }
+                }
+                catch (Exception e)
+                {
+                    // Non-retryable error
+                    try { _listener?.Close(); } catch { }
+                    _listener = null;
+                    _executor = null;
+                    _sseManager = null;
+                    Logger.LogError($"Failed to start {ServerName} MCP server: {e.Message}");
+                    return false;
+                }
             }
-            catch (Exception e)
-            {
-                Logger.LogError($"Failed to start {ServerName} MCP server: {e.Message}");
-            }
+
+            return false; // All retries failed
         }
 
         /// <summary>
@@ -131,8 +165,9 @@ namespace AIRON.MCP
             _sseManager?.Shutdown();
             _sseManager = null;
 
-            try { _listener?.Stop(); } catch { }
-            try { _listener?.Close(); } catch { }
+            // Use Abort() for aggressive shutdown - immediately terminates all operations
+            // and releases the port faster than Stop() + Close()
+            try { _listener?.Abort(); } catch { }
             _listenerThread?.Join(Constants.ThreadJoinTimeoutMs);
 
             _sessions.Clear();
@@ -617,6 +652,55 @@ namespace AIRON.MCP
         protected string RunOnMainThread(Func<string> action)
         {
             return _executor?.Execute(action) ?? "Error: Executor not initialized";
+        }
+
+        #endregion
+
+        #region Exception Helpers
+
+        /// <summary>
+        /// Checks if an exception indicates that the address/port is already in use.
+        /// Handles HttpListenerException, SocketException, and their inner exceptions.
+        /// </summary>
+        private static bool IsAddressInUseException(Exception e)
+        {
+            // Error codes for "address already in use"
+            // 183: Windows ERROR_ALREADY_EXISTS
+            // 48: macOS/Linux EADDRINUSE
+            // 10048: Windows WSAEADDRINUSE
+            // 98: Linux EADDRINUSE
+            int[] addressInUseCodes = { 183, 48, 10048, 98 };
+
+            // Check the exception and all inner exceptions
+            Exception current = e;
+            while (current != null)
+            {
+                // Check HttpListenerException
+                if (current is HttpListenerException httpEx)
+                {
+                    foreach (int code in addressInUseCodes)
+                    {
+                        if (httpEx.ErrorCode == code) return true;
+                    }
+                }
+
+                // Check SocketException
+                if (current is System.Net.Sockets.SocketException socketEx)
+                {
+                    foreach (int code in addressInUseCodes)
+                    {
+                        if ((int)socketEx.SocketErrorCode == code || socketEx.ErrorCode == code)
+                            return true;
+                    }
+                    // Also check for AddressAlreadyInUse enum value
+                    if (socketEx.SocketErrorCode == System.Net.Sockets.SocketError.AddressAlreadyInUse)
+                        return true;
+                }
+
+                current = current.InnerException;
+            }
+
+            return false;
         }
 
         #endregion

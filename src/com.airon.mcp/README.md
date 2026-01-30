@@ -72,7 +72,7 @@ claude mcp remove unity-editor
 
 ## Configuration File
 
-AIRON MCP uses a file-based configuration system stored in `ProjectSettings/AironMcpConfig.json`. This allows you to:
+AIRON MCP uses a file-based configuration system stored in `ProjectSettings/Packages/com.airon.mcp/Settings.json`. This allows you to:
 - **Version control** your MCP tool configurations
 - **Share configurations** across your team
 - **Edit directly** or use the GUI in AIRON Control window
@@ -105,7 +105,7 @@ AIRON MCP uses a file-based configuration system stored in `ProjectSettings/Airo
 You can edit the configuration file directly or use these menu items:
 - **Window -> AIRON Control -> Open Window** - GUI configuration editor
 - **Window -> AIRON Control -> Open Config File** - Open configuration file location
-- **Window -> AIRON Control -> Reset to Defaults** - Delete config and restore defaults
+- **Window -> AIRON Control -> Reset to Examples** - Delete config and restore example configuration
 
 ## Quick Start
 
@@ -433,7 +433,7 @@ See the main AIRON documentation for complete remote system setup.
 
 ## Version
 
-- **Version**: 0.2.1-alpha
+- **Version**: 0.9.0-beta
 - **Unity Version**: 2021.3+
 - **MCP Protocol**: 2024-11-05
 - **Transport**: Streamable HTTP (MCP spec 2025-03-26)

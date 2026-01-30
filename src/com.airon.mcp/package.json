@@ -1,6 +1,6 @@
 {
   "name": "com.airon.mcp",
-  "version": "0.2.1-alpha",
+  "version": "0.9.0-beta",
   "displayName": "AIRON MCP",
   "description": "MCP servers for Claude Code integration",
   "unity": "2021.3",

@@ -7,43 +7,72 @@
  * See: https://opensource.org/licenses/MIT
  *
  * Unified entry point for AIRON - can run as node client, relay server, or bridge.
+ * Uses OAuth/OIDC for authentication (provider-agnostic).
  *
  * Usage:
  *   airon [options] [relay-url]           Node mode (default) - connect to relay
  *   airon -m relay                        Relay mode - run as relay server
- *   airon -m bridge [--editor|--game|--both]  Bridge mode - stdio MCP bridge
+ *   airon -m bridge [port]                Bridge mode - stdio MCP bridge (generic)
+ *   airon -m bridge --editor [port]       Bridge mode - Unity Editor MCP
+ *   airon -m bridge --game [port]         Bridge mode - Unity Game MCP
  *
  * Run 'airon --help' for full options.
  */
 
-import WebSocket from 'ws';
 import { platform, homedir } from 'os';
 import { execSync, spawnSync, spawn } from 'child_process';
-import { resolve, relative, join } from 'path';
+import { resolve, relative, join, dirname } from 'path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from 'fs';
 import { randomUUID } from 'crypto';
 import readline from 'readline';
+import open from 'open';
 
 // Static imports for all modes (required for SEA bundle)
 import { startRelay } from './airon-relay.js';
 import { startBridge } from './airon-bridge.js';
 
-let WORKING_DIR = process.cwd(); // Default: where airon.js was launched, can be overridden by -p/--path
+// ============================================================
+// Configuration
+// ============================================================
 
-// Global state variables - must be declared before functions that use them
+const CREDENTIALS_PATH = join(homedir(), '.airon', 'credentials.json');
+const DEFAULT_RELAY_URL = 'https://dev.airon.games';
+const DEFAULT_OIDC_ISSUER = 'https://accounts.google.com';
+
+let WORKING_DIR = process.cwd();
+let RELAY_URL = DEFAULT_RELAY_URL;
+let UNITY_EDITOR_PORT = 3002;
+let UNITY_GAME_PORT = 3003;
+
+// OIDC configuration
+let OIDC_ISSUER = null;
+let OIDC_CLIENT_ID = null;
+let OIDC_CLIENT_SECRET = null;
+
+// OIDC endpoints (discovered at runtime)
+let oidcConfig = null;
+
+// Current tokens
+let currentIdToken = null;
+let currentCredentials = null;
+
+// ============================================================
+// Global State
+// ============================================================
+
 let currentTask = null;
 let isAborted = false;
-let activeSessions = new Map(); // sessionId -> { process, status, output, sessionId }
-let currentSessionId = null; // Track the most recent session
+let activeSessions = new Map();
+let currentSessionId = null;
 let currentProcess = null;
-let outputBuffer = '';
 let taskCompletionResolve = null;
-let readlineInterface = null; // Store readline interface globally
-let currentWs = null; // Store WebSocket connection for admin commands
-let adminCheckInProgress = false; // Flag to suppress error messages during admin check
+let readlineInterface = null;
+
+// ============================================================
+// Path Validation
+// ============================================================
 
 function validatePath(requestedPath) {
-  // Block UNC paths and absolute paths
   if (requestedPath.startsWith('\\\\') || requestedPath.match(/^[a-zA-Z]:/)) {
     throw new Error('Access denied: Absolute and UNC paths not allowed');
   }
@@ -51,13 +80,10 @@ function validatePath(requestedPath) {
   const absolutePath = resolve(WORKING_DIR, requestedPath);
   const relativePath = relative(WORKING_DIR, absolutePath);
   
-  // Allow the working directory itself (empty relative path)
-  // But block paths that escape to parent directories
   if (relativePath.startsWith('..')) {
     throw new Error('Access denied: Path must be within working directory');
   }
   
-  // Resolve symlinks and check again
   try {
     const realPath = realpathSync(absolutePath);
     const realRelative = relative(WORKING_DIR, realPath);
@@ -65,7 +91,6 @@ function validatePath(requestedPath) {
       throw new Error('Access denied: Symlink points outside working directory');
     }
   } catch (err) {
-    // If realpath fails (file doesn't exist yet), that's ok
     if (err.code !== 'ENOENT') {
       throw err;
     }
@@ -74,11 +99,164 @@ function validatePath(requestedPath) {
   return absolutePath;
 }
 
-// Spawn Claude Code with common event handling
+// ============================================================
+// OIDC Discovery and Token Management
+// ============================================================
+
+async function discoverOIDC() {
+  if (oidcConfig) return oidcConfig;
+  
+  const discoveryUrl = `${OIDC_ISSUER}/.well-known/openid-configuration`;
+  const response = await fetch(discoveryUrl);
+  oidcConfig = await response.json();
+  return oidcConfig;
+}
+
+async function loadCredentials() {
+  try {
+    const data = readFileSync(CREDENTIALS_PATH, 'utf-8');
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
+async function saveCredentials(credentials) {
+  const dir = dirname(CREDENTIALS_PATH);
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+  writeFileSync(CREDENTIALS_PATH, JSON.stringify(credentials, null, 2));
+}
+
+async function refreshTokens(refreshToken) {
+  const config = await discoverOIDC();
+  
+  const params = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+    client_id: OIDC_CLIENT_ID,
+    client_secret: OIDC_CLIENT_SECRET
+  });
+  
+  const response = await fetch(config.token_endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  });
+  
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Token refresh failed: ${error}`);
+  }
+  
+  return response.json();
+}
+
+async function authenticate() {
+  if (!OIDC_CLIENT_ID) {
+    throw new Error('OIDC client ID not configured. Use --client-id');
+  }
+  
+  // Check for existing credentials
+  const existing = await loadCredentials();
+  
+  if (existing?.refresh_token) {
+    try {
+      console.log('  🔄 Refreshing token...');
+      const tokens = await refreshTokens(existing.refresh_token);
+      tokens.refresh_token = tokens.refresh_token || existing.refresh_token;
+      await saveCredentials(tokens);
+      currentCredentials = tokens;
+      console.log('  ✓ Token refreshed');
+      return tokens.id_token;
+    } catch (err) {
+      console.log('  ⚠️ Token refresh failed, re-authenticating...');
+    }
+  }
+  
+  // Start OAuth flow via relay
+  const state = randomUUID();
+  
+  const authUrl = new URL(`${RELAY_URL}/authorize`);
+  authUrl.searchParams.set('client_type', 'node');
+  authUrl.searchParams.set('state', state);
+  
+  console.log('  🔐 Opening browser for authentication...');
+  console.log(`  📎 If browser doesn't open, visit: ${authUrl.toString()}\n`);
+  
+  open(authUrl.toString()).catch(() => {
+    console.log('  ⚠️ Could not open browser automatically');
+  });
+  
+  // Poll for tokens
+  console.log('  ⏳ Waiting for authentication...');
+  const pollInterval = 2000;
+  const maxAttempts = 150;
+  
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, pollInterval));
+    
+    try {
+      const response = await fetch(`${RELAY_URL}/poll-token?state=${state}`);
+      const data = await response.json();
+      
+      if (data.status === 'ready') {
+        const tokens = {
+          id_token: data.id_token,
+          refresh_token: data.refresh_token
+        };
+        await saveCredentials(tokens);
+        currentCredentials = tokens;
+        console.log('  ✓ Authentication successful');
+        return tokens.id_token;
+      }
+      
+      if (data.error) {
+        throw new Error(data.error);
+      }
+    } catch (err) {
+      if (err.message !== 'fetch failed') {
+        throw err;
+      }
+    }
+  }
+  
+  throw new Error('Authentication timeout');
+}
+
+async function refreshTokenIfNeeded() {
+  if (!currentCredentials?.refresh_token) return;
+  
+  try {
+    const parts = currentCredentials.id_token.split('.');
+    if (parts.length !== 3) return;
+    
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+    const expiryTime = payload.exp * 1000;
+    
+    if (Date.now() > expiryTime - 5 * 60 * 1000) {
+      console.log('  🔄 Token expiring soon, refreshing...');
+      const tokens = await refreshTokens(currentCredentials.refresh_token);
+      tokens.refresh_token = tokens.refresh_token || currentCredentials.refresh_token;
+      await saveCredentials(tokens);
+      currentCredentials = tokens;
+      currentIdToken = tokens.id_token;
+      console.log('  ✓ Token refreshed');
+    }
+  } catch (err) {
+    console.error('  ❌ Token refresh failed:', err.message);
+  }
+}
+
+// ============================================================
+// Claude Code Session Management
+// ============================================================
+
 function spawnClaudeCode(args, sessionId, sessionData) {
   return new Promise((resolve) => {
     const isWindows = platform() === 'win32';
-    let localOutputBuffer = ''; // Local buffer to avoid bundling scope issues
+    let localOutputBuffer = '';
     
     let proc;
     if (isWindows) {
@@ -93,31 +271,26 @@ function spawnClaudeCode(args, sessionId, sessionData) {
       });
     }
     
-    // Close stdin immediately - we're not using interactive mode
     proc.stdin.end();
     
-    // Setup stdout handler
     proc.stdout.on('data', (data) => {
       const text = data.toString();
       console.log('     ' + text.replace(/\n/g, '\n     '));
       localOutputBuffer += text;
     });
     
-    // Setup stderr handler
     proc.stderr.on('data', (data) => {
       const text = data.toString();
       localOutputBuffer += text;
       process.stdout.write('     ' + text.replace(/\n/g, '\n     '));
     });
     
-    // Setup close handler
     proc.on('close', (code) => {
       const session = activeSessions.get(sessionId);
       if (session) {
         session.status = isAborted ? 'aborted' : (code === 0 ? 'completed' : 'failed');
         session.finished = new Date().toISOString();
         
-        // Clean up completed/failed sessions after 5 minutes (only for initial sessions)
         if (sessionData.cleanupAfter) {
           setTimeout(() => {
             activeSessions.delete(sessionId);
@@ -133,7 +306,7 @@ function spawnClaudeCode(args, sessionId, sessionData) {
         status: status,
         finished: new Date().toISOString(),
         exitCode: code,
-        output: localOutputBuffer // Use local buffer
+        output: localOutputBuffer
       };
       
       if (isAborted) {
@@ -150,13 +323,12 @@ function spawnClaudeCode(args, sessionId, sessionData) {
       if (taskCompletionResolve) {
         const resolver = taskCompletionResolve;
         taskCompletionResolve = null;
-        resolver(localOutputBuffer); // Use local buffer
+        resolver(localOutputBuffer);
       } else {
-        resolve(localOutputBuffer); // Use local buffer
+        resolve(localOutputBuffer);
       }
     });
     
-    // Setup error handler
     proc.on('error', (err) => {
       const session = activeSessions.get(sessionId);
       if (session) {
@@ -174,33 +346,30 @@ function spawnClaudeCode(args, sessionId, sessionData) {
       }
     });
     
-    // Set currentProcess as side effect so it's available globally
     currentProcess = proc;
   });
 }
 
-// Parse command line arguments
+// ============================================================
+// Command Line Parsing
+// ============================================================
+
 function parseArgs() {
   const args = process.argv.slice(2);
   const parsed = {};
 
-  // Map of short args to long args
   const argAliases = {
     'h': 'help',
     'm': 'mode',
-    'u': 'user',
-    's': 'secret',
     'e': 'editor-port',
     'g': 'game-port',
     'p': 'path'
   };
 
-  // Boolean flags (no value needed)
   const booleanFlags = ['help', 'h'];
 
   for (let i = 0; i < args.length; i++) {
     if (args[i].startsWith('--')) {
-      // Long argument (e.g., --mode)
       const key = args[i].substring(2);
       if (booleanFlags.includes(key)) {
         parsed[key] = true;
@@ -208,11 +377,10 @@ function parseArgs() {
         const value = args[i + 1];
         if (value && !value.startsWith('-')) {
           parsed[key] = value;
-          i++; // Skip next arg since we consumed it
+          i++;
         }
       }
     } else if (args[i].startsWith('-')) {
-      // Short argument (e.g., -m)
       const shortKey = args[i].substring(1);
       const longKey = argAliases[shortKey] || shortKey;
       if (booleanFlags.includes(shortKey)) {
@@ -221,63 +389,15 @@ function parseArgs() {
         const value = args[i + 1];
         if (value && !value.startsWith('-')) {
           parsed[longKey] = value;
-          i++; // Skip next arg since we consumed it
+          i++;
         }
       }
     } else if (!parsed.relay) {
-      // First non-flag argument is relay URL (only for node mode)
       parsed.relay = args[i];
     }
   }
 
   return parsed;
-}
-
-// Prompt for input
-async function prompt(question, hidden = false) {
-  return new Promise((resolve) => {
-    if (hidden) {
-      // For hidden input, manually handle stdin
-      process.stdout.write(question);
-      process.stdin.setRawMode(true);
-      process.stdin.resume();
-      process.stdin.setEncoding('utf8');
-      
-      let input = '';
-      const onData = (char) => {
-        if (char === '\n' || char === '\r' || char === '\u0004') {
-          // Enter or Ctrl+D
-          process.stdin.setRawMode(false);
-          process.stdin.pause();
-          process.stdin.removeListener('data', onData);
-          process.stdout.write('\n');
-          resolve(input.trim());
-        } else if (char === '\u0003') {
-          // Ctrl+C
-          process.exit(0);
-        } else if (char === '\u007f' || char === '\b') {
-          // Backspace
-          if (input.length > 0) {
-            input = input.slice(0, -1);
-          }
-        } else {
-          input += char;
-        }
-      };
-      
-      process.stdin.on('data', onData);
-    } else {
-      const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout
-      });
-      
-      rl.question(question, (answer) => {
-        rl.close();
-        resolve(answer.trim());
-      });
-    }
-  });
 }
 
 const args = parseArgs();
@@ -290,9 +410,10 @@ if (args.help || args.h) {
   console.log('    -m, --mode <mode>          Operating mode: node (default), relay, or bridge');
   console.log('');
   console.log('  Node Mode (default) - Connect to relay server:');
-  console.log('    airon <relay-url> [options]');
-  console.log('    -u, --user <username>      Username for authentication');
-  console.log('    -s, --secret <secret>      Secret token (min 16 chars)');
+  console.log('    airon [relay-url] [options]');
+  console.log('    --issuer <url>             OIDC issuer URL (default: https://accounts.google.com)');
+  console.log('    --client-id <id>           OAuth Client ID');
+  console.log('    --client-secret <secret>   OAuth Client Secret (for token refresh)');
   console.log('    -e, --editor-port <port>   Unity Editor MCP port (default: 3002)');
   console.log('    -g, --game-port <port>     Unity Game MCP port (default: 3003)');
   console.log('    -p, --path <directory>     Working directory (default: current)');
@@ -301,275 +422,95 @@ if (args.help || args.h) {
   console.log('    airon -m relay');
   console.log('    Environment variables:');
   console.log('      PORT                     Server port (default: 3001)');
-  console.log('      AIRON_DATA_DIR           Directory for airon-nodes.json (default: .)');
-  console.log('      AIRON_ADMIN_NODE         Initial admin token (username:secret)');
+  console.log('      AIRON_OIDC_ISSUER        OIDC issuer URL');
+  console.log('      AIRON_OIDC_CLIENT_ID     OAuth Client ID');
   console.log('');
-  console.log('  Bridge Mode - Stdio MCP bridge for Unity:');
-  console.log('    airon -m bridge [--editor|--game|--both]');
-  console.log('    --editor                   Bridge to Unity Editor MCP (port 3002, default)');
-  console.log('    --game                     Bridge to Unity Game MCP (port 3003)');
-  console.log('    --both                     Bridge to both Editor and Game MCP');
+  console.log('  Bridge Mode - Stdio MCP bridge:');
+  console.log('    airon -m bridge [port]               Generic MCP on specified port');
+  console.log('    airon -m bridge --editor [port]      Unity Editor MCP (default: 3002)');
+  console.log('    airon -m bridge --game [port]        Unity Game MCP (default: 3003)');
   console.log('');
   console.log('  General:');
   console.log('    -h, --help                 Show this help message');
   console.log('');
   console.log('  Examples:');
-  console.log('    airon https://relay.example.com/mcp -u myuser -s my-secret-token');
+  console.log('    airon --client-id <id>');
+  console.log('    airon https://custom-relay.com --client-id <id>');
   console.log('    airon -m relay');
-  console.log('    airon -m bridge --editor');
-  console.log('    airon -m bridge --both\n');
+  console.log('    airon -m bridge --editor\n');
   process.exit(0);
 }
 
-// Mode routing - determine which mode to run
+// Mode routing
 const runMode = args.mode || 'node';
 
 if (runMode === 'relay') {
   startRelay();
 } else if (runMode === 'bridge') {
-  // Determine bridge sub-mode from args
-  let bridgeMode = 'editor';
-  if (process.argv.includes('--game')) bridgeMode = 'game';
-  else if (process.argv.includes('--both')) bridgeMode = 'both';
-  startBridge(bridgeMode);
+  const bridgeArgs = process.argv.slice(2).filter(a => a !== '-m' && a !== '--mode' && a !== 'bridge');
+  let bridgeMode = null;
+  let bridgePort = null;
+
+  for (let i = 0; i < bridgeArgs.length; i++) {
+    if (bridgeArgs[i] === '--editor') {
+      bridgeMode = 'editor';
+      if (bridgeArgs[i + 1] && !bridgeArgs[i + 1].startsWith('--') && !isNaN(parseInt(bridgeArgs[i + 1]))) {
+        bridgePort = parseInt(bridgeArgs[i + 1]);
+        i++;
+      }
+    } else if (bridgeArgs[i] === '--game') {
+      bridgeMode = 'game';
+      if (bridgeArgs[i + 1] && !bridgeArgs[i + 1].startsWith('--') && !isNaN(parseInt(bridgeArgs[i + 1]))) {
+        bridgePort = parseInt(bridgeArgs[i + 1]);
+        i++;
+      }
+    } else if (!bridgeArgs[i].startsWith('-') && !isNaN(parseInt(bridgeArgs[i]))) {
+      bridgePort = parseInt(bridgeArgs[i]);
+    }
+  }
+
+  startBridge(bridgeMode, bridgePort);
 } else if (runMode !== 'node') {
   console.error(`\n  ❌ Unknown mode: ${runMode}`);
   console.error('  Valid modes: node, relay, bridge\n');
   process.exit(1);
 } else {
-  // Node mode - run the node client
   runNodeMode();
 }
 
-// Node mode code wrapped in function to prevent execution in relay/bridge modes
+// ============================================================
+// Node Mode
+// ============================================================
+
 function runNodeMode() {
 
-// Handle working directory override
+// Handle configuration
 if (args.path) {
   const requestedPath = resolve(args.path);
   if (!existsSync(requestedPath)) {
     console.error(`\n  ❌ Error: Path does not exist: ${requestedPath}\n`);
     process.exit(1);
   }
-  try {
-    const stats = require('fs').statSync(requestedPath);
-    if (!stats.isDirectory()) {
-      console.error(`\n  ❌ Error: Path is not a directory: ${requestedPath}\n`);
-      process.exit(1);
-    }
-  } catch (err) {
-    console.error(`\n  ❌ Error: Cannot access path: ${err.message}\n`);
-    process.exit(1);
-  }
   WORKING_DIR = requestedPath;
-  console.log(`\n  📁 Working directory: ${WORKING_DIR}\n`);
 }
 
-// Validate relay URL
-if (!args.relay) {
-  console.error('\n  ❌ Error: Missing relay URL\n');
-  console.error('  Usage: airon <relay-url> [-u|--user <username>] [-s|--secret <secret>] [-e|--editor-port <port>] [-g|--game-port <port>] [-p|--path <working-dir>]\n');
-  console.error('  Example: airon https://relay.example.com/mcp -u myusername -s my-secret-token-here\n');
-  console.error('  Or: airon https://relay.example.com/mcp --user myusername --secret my-secret-token-here\n');
-  console.error('  Or: airon https://relay.example.com/mcp -u myusername -s token -e 3002 -g 3003\n');
-  console.error('  Or: airon https://relay.example.com/mcp -u myuser -s token -p /path/to/project\n');
-  console.error('  Or: airon https://relay.example.com/mcp (will prompt for user/secret)\n');
+OIDC_ISSUER = args['issuer'] || process.env.AIRON_OIDC_ISSUER || DEFAULT_OIDC_ISSUER;
+OIDC_CLIENT_ID = args['client-id'] || process.env.AIRON_OIDC_CLIENT_ID;
+OIDC_CLIENT_SECRET = args['client-secret'] || process.env.AIRON_OIDC_CLIENT_SECRET;
+RELAY_URL = args.relay || DEFAULT_RELAY_URL;
+UNITY_EDITOR_PORT = parseInt(args['editor-port']) || 3002;
+UNITY_GAME_PORT = parseInt(args['game-port']) || 3003;
+
+if (!OIDC_CLIENT_ID) {
+  console.error('\n  ❌ Error: OAuth client ID required\n');
+  console.error('  Use: airon --client-id <id>\n');
+  console.error('  Or set environment variable: AIRON_OIDC_CLIENT_ID\n');
   process.exit(1);
 }
 
-// Validate URL format
-if (!args.relay.match(/^https?:\/\//)) {
-  console.error('\n  ❌ Error: Invalid relay URL\n');
-  console.error('  URL must start with http:// or https://\n');
-  console.error(`  You provided: ${args.relay}\n`);
-  console.error('  Example: https://relay.example.com/mcp\n');
-  process.exit(1);
-}
-
-// Force HTTPS for non-localhost connections
-if (!args.relay.match(/^https:\/\//) && !args.relay.includes('localhost') && !args.relay.includes('127.0.0.1')) {
-  console.error('\n  ❌ Error: HTTPS required for remote connections\n');
-  console.error('  Only localhost can use HTTP\n');
-  console.error(`  You provided: ${args.relay}\n`);
-  console.error('  Use: https:// instead of http://\n');
-  process.exit(1);
-}
-
-// Global variables that will be set by main()
-let RELAY_URL;
-let token;
-let MCP_URL;
-let UNITY_SECRET;
-let UNITY_EDITOR_PORT;
-let UNITY_GAME_PORT;
-let isAdminNode = false; // Will be set after connecting and checking status
-
-// Main async function to handle prompts and connection
-async function main() {
-  // Prompt for user and secret if not provided
-  if (!args.user) {
-    args.user = await prompt('  👤 Username: ');
-  }
-
-  if (!args.secret) {
-    args.secret = await prompt('  🔑 Secret: ', true); // Hidden input
-  }
-
-  if (!args.user || !args.secret) {
-    console.error('\n  ❌ Error: User and secret are required\n');
-    process.exit(1);
-  }
-
-  if (args.secret.length < 16) {
-    console.error('\n  ❌ Error: Secret must be at least 16 characters\n');
-    process.exit(1);
-  }
-
-RELAY_URL = args.relay.replace(/^https?:\/\//, 'wss://').replace(/\/mcp$/, ''); // Convert to WebSocket URL
-token = `${args.user}:${args.secret}`;
-MCP_URL = `${args.relay}/${args.user}/${args.secret}`;
-UNITY_SECRET = args.secret; // Use same secret for Unity MCP
-UNITY_EDITOR_PORT = parseInt(args['editor-port']) || 3002; // Default to 3002
-UNITY_GAME_PORT = parseInt(args['game-port']) || 3003; // Default to 3003
-
-console.log(`\n  🔗 Connecting to: ${RELAY_URL}`);
-console.log(`  👤 User: ${args.user}`);
-console.log(`  🎮 Unity Editor Port: ${UNITY_EDITOR_PORT}`);
-console.log(`  🎮 Unity Game Port: ${UNITY_GAME_PORT}\n`);
-
-// Check and setup Claude Code settings
-function checkClaudeSettings() {
-  const claudeDir = join(homedir(), '.claude');
-  const settingsPath = join(claudeDir, 'settings.json');
-  
-  console.log('\n  🔍 Checking Claude Code MCP settings...');
-  
-  // Check if .claude directory exists
-  if (!existsSync(claudeDir)) {
-    console.log('  📁 Creating .claude directory...');
-    try {
-      mkdirSync(claudeDir, { recursive: true });
-    } catch (err) {
-      console.error(`  ❌ Failed to create .claude directory: ${err.message}`);
-      return;
-    }
-  }
-  
-  // Check if settings.json exists
-  if (!existsSync(settingsPath)) {
-    console.log('  📝 Creating settings.json with MCP permissions...');
-    const defaultSettings = {
-      mcpServers: {
-        "unity-editor": {
-          url: `http://localhost:${UNITY_EDITOR_PORT}/mcp`
-        },
-        "unity-game": {
-          url: `http://localhost:${UNITY_GAME_PORT}/mcp`
-        }
-      },
-      permissions: {
-        allow: [
-          // Unity MCP Servers
-          "mcp__unity-editor__*",
-          "mcp__unity-game__*",
-          
-          // Claude Code File Operations (restricted to working directory)
-          "Read_file__**",
-          "Write_file__**",
-          "Edit_file__**",
-          "Create_file__**",
-          "List_directory__**"
-        ],
-        deny: [
-          // Deny execution commands for safety
-          "Execute__*",
-          "Run_terminal_command__*"
-        ]
-      }
-    };
-    
-    try {
-      writeFileSync(settingsPath, JSON.stringify(defaultSettings, null, 2), 'utf-8');
-      console.log('  ✅ Created settings.json with Unity MCP permissions');
-    } catch (err) {
-      console.error(`  ❌ Failed to create settings.json: ${err.message}`);
-    }
-  } else {
-    // File exists, check if it has permissions
-    try {
-      const content = readFileSync(settingsPath, 'utf-8');
-      const settings = JSON.parse(content);
-      
-      if (!settings.permissions || !settings.permissions.allow || settings.permissions.allow.length === 0) {
-        console.log('  ⚠️  settings.json exists but has no permissions configured');
-        console.log('  📝 Please add to ~/.claude/settings.json:');
-        console.log('');
-        console.log('  {');
-        console.log('    "mcpServers": {');
-        console.log('      "unity-editor": {');
-        console.log(`        "url": "http://localhost:${UNITY_EDITOR_PORT}/mcp"`);
-        console.log('      },');
-        console.log('      "unity-game": {');
-        console.log(`        "url": "http://localhost:${UNITY_GAME_PORT}/mcp"`);
-        console.log('      }');
-        console.log('    },');
-        console.log('    "permissions": {');
-        console.log('      "allow": [');
-        console.log('        // Unity MCP Servers');
-        console.log('        "mcp__unity-editor__*",');
-        console.log('        "mcp__unity-game__*",');
-        console.log('        ');
-        console.log('        // Claude Code File Operations (working directory only)');
-        console.log('        "Read_file__**",');
-        console.log('        "Write_file__**",');
-        console.log('        "Edit_file__**",');
-        console.log('        "Create_file__**",');
-        console.log('        "List_directory__**"');
-        console.log('      ],');
-        console.log('      "deny": [');
-        console.log('        // Deny execution for safety');
-        console.log('        "Execute__*",');
-        console.log('        "Run_terminal_command__*"');
-        console.log('      ]');
-        console.log('    }');
-        console.log('  }');
-        console.log('');
-        console.log('  ❌ AIRON node cannot start without permissions configured.\n');
-        process.exit(1);
-      } else {
-        // Check if Unity MCP permissions are present
-        const hasUnityEditor = settings.permissions.allow.some(p => p.includes('unity-editor'));
-        const hasUnityGame = settings.permissions.allow.some(p => p.includes('unity-game'));
-        
-        // Check if MCP servers are configured
-        const hasEditorServer = settings.mcpServers && settings.mcpServers['unity-editor'];
-        const hasGameServer = settings.mcpServers && settings.mcpServers['unity-game'];
-        
-        if (hasUnityEditor && hasUnityGame) {
-          console.log('  ✅ Unity MCP permissions are configured');
-        } else {
-          console.log('  ⚠️  Unity MCP permissions may be incomplete');
-          if (!hasUnityEditor) console.log('     Missing: mcp__unity-editor__*');
-          if (!hasUnityGame) console.log('     Missing: mcp__unity-game__*');
-        }
-        
-        if (hasEditorServer && hasGameServer) {
-          console.log('  ✅ Unity MCP servers are configured');
-        } else {
-          console.log('  ⚠️  Unity MCP servers not configured in settings.json');
-          console.log(`     Add "mcpServers" section with unity-editor (port ${UNITY_EDITOR_PORT}) and unity-game (port ${UNITY_GAME_PORT})`);
-        }
-      }
-    } catch (err) {
-      console.error(`  ❌ Failed to read/parse settings.json: ${err.message}`);
-    }
-  }
-  
-  console.log('');
-}
-
-// Run settings check
-checkClaudeSettings();
+// ============================================================
+// Status Checks
+// ============================================================
 
 function checkClaudeCode() {
   try {
@@ -602,12 +543,10 @@ function checkUnityEditor() {
 }
 
 function checkUnityGame() {
-  // Check for common Unity player processes
   const isWindows = platform() === 'win32';
   try {
     if (isWindows) {
       const result = execSync('tasklist /NH', { encoding: 'utf-8', timeout: 5000 });
-      // Look for common Unity game patterns (customize as needed)
       if (result.includes('TRTCU.exe') || result.includes('Game.exe')) {
         return 'running';
       }
@@ -632,9 +571,7 @@ function checkPort(port) {
 }
 
 async function checkUnityEditorMCP() {
-  if (!checkPort(UNITY_EDITOR_PORT)) {
-    return 'not running';
-  }
+  if (!checkPort(UNITY_EDITOR_PORT)) return 'not running';
   
   try {
     const response = await fetch(`http://localhost:${UNITY_EDITOR_PORT}/mcp`, {
@@ -644,10 +581,7 @@ async function checkUnityEditorMCP() {
         jsonrpc: '2.0',
         id: Date.now(),
         method: 'tools/call',
-        params: {
-          name: 'status',
-          arguments: {}
-        }
+        params: { name: 'status', arguments: {} }
       })
     });
     
@@ -660,13 +594,11 @@ async function checkUnityEditorMCP() {
     }
   } catch {}
   
-  return `running (port ${UNITY_EDITOR_PORT})`;
+  return 'running';
 }
 
 async function checkUnityGameMCP() {
-  if (!checkPort(UNITY_GAME_PORT)) {
-    return 'not running';
-  }
+  if (!checkPort(UNITY_GAME_PORT)) return 'not running';
   
   try {
     const response = await fetch(`http://localhost:${UNITY_GAME_PORT}/mcp`, {
@@ -676,10 +608,7 @@ async function checkUnityGameMCP() {
         jsonrpc: '2.0',
         id: Date.now(),
         method: 'tools/call',
-        params: {
-          name: 'status',
-          arguments: {}
-        }
+        params: { name: 'status', arguments: {} }
       })
     });
     
@@ -687,17 +616,19 @@ async function checkUnityGameMCP() {
     if (data.result?.content?.[0]?.text) {
       const status = JSON.parse(data.result.content[0].text);
       if (status.serverStartTime) {
+        if (status.running === false) {
+          return `standby: ${status.serverStartTime}`;
+        }
         return `launched: ${status.serverStartTime}`;
       }
     }
   } catch {}
   
-  return `running (port ${UNITY_GAME_PORT})`;
+  return 'running';
 }
 
 async function getStatus() {
   let taskInfo = null;
-  // Only show task if it's actually running
   if (currentTask && currentTask.status === 'running') {
     taskInfo = {
       description: currentTask.description,
@@ -707,7 +638,6 @@ async function getStatus() {
     };
   }
   
-  // List active sessions
   const sessions = Array.from(activeSessions.values()).map(s => ({
     sessionId: s.sessionId,
     status: s.status,
@@ -726,6 +656,10 @@ async function getStatus() {
   };
 }
 
+// ============================================================
+// Claude Code Operations
+// ============================================================
+
 function runClaudeCodeInteractive(description) {
   const sessionId = randomUUID();
   currentSessionId = sessionId;
@@ -738,30 +672,24 @@ function runClaudeCodeInteractive(description) {
     interactive: true
   };
   
-  const sessionOutput = [];
-  
   console.log(`\n  🤖 Claude Code session ID: ${sessionId}\n`);
 
-  // Run in safe mode first - no --dangerously-skip-permissions
-  // Let Claude Code analyze and explain what it wants to do
-  const args = ['-p', description];
+  const cliArgs = ['-p', description];
 
   activeSessions.set(sessionId, {
-    process: null, // Will be set below
+    process: null,
     status: 'running',
-    output: sessionOutput,
+    output: [],
     sessionId: sessionId,
     started: currentTask.started,
-    description: description // Store original description for force execution
+    description: description
   });
   
-  const promise = spawnClaudeCode(args, sessionId, {
+  const promise = spawnClaudeCode(cliArgs, sessionId, {
     cleanupAfter: true,
     successMessage: 'Session completed'
   });
   
-  // The promise wraps the process setup, currentProcess is set inside spawnClaudeCode
-  // Update session with process after spawn returns
   activeSessions.get(sessionId).process = currentProcess;
   
   return promise;
@@ -771,7 +699,7 @@ function continueClaudeSession(sessionId, userInput) {
   return new Promise((resolve) => {
     const session = activeSessions.get(sessionId);
     if (!session) {
-      resolve(`❌ Session ${sessionId} not found. Available sessions: ${Array.from(activeSessions.keys()).join(', ')}`);
+      resolve(`❌ Session ${sessionId} not found.`);
       return;
     }
     
@@ -782,7 +710,6 @@ function continueClaudeSession(sessionId, userInput) {
     
     taskCompletionResolve = resolve;
     
-    // Get original description from session
     const originalDescription = session.description || 'Continue session';
     
     currentTask = {
@@ -793,10 +720,9 @@ function continueClaudeSession(sessionId, userInput) {
       interactive: true
     };
 
-    // Continue in interactive mode (no --dangerously-skip-permissions)
-    const args = ['-p', originalDescription];
+    const cliArgs = ['-p', originalDescription];
     
-    currentProcess = spawnClaudeCode(args, sessionId, {
+    currentProcess = spawnClaudeCode(cliArgs, sessionId, {
       cleanupAfter: false,
       successMessage: 'Session continued'
     });
@@ -810,7 +736,7 @@ function forceClaudeSession(sessionId) {
   return new Promise((resolve) => {
     const session = activeSessions.get(sessionId);
     if (!session) {
-      resolve(`❌ Session ${sessionId} not found. Available sessions: ${Array.from(activeSessions.keys()).join(', ')}`);
+      resolve(`❌ Session ${sessionId} not found.`);
       return;
     }
     
@@ -819,7 +745,6 @@ function forceClaudeSession(sessionId) {
     
     taskCompletionResolve = resolve;
     
-    // Get original description from session
     const originalDescription = session.description || 'Continue session';
     
     currentTask = {
@@ -830,10 +755,9 @@ function forceClaudeSession(sessionId) {
       interactive: false
     };
 
-    // Run the ORIGINAL task with --dangerously-skip-permissions
-    const args = ['-p', originalDescription, '--dangerously-skip-permissions'];
+    const cliArgs = ['-p', originalDescription, '--dangerously-skip-permissions'];
     
-    currentProcess = spawnClaudeCode(args, sessionId, {
+    currentProcess = spawnClaudeCode(cliArgs, sessionId, {
       cleanupAfter: false,
       successMessage: 'Forced execution completed'
     });
@@ -843,56 +767,48 @@ function forceClaudeSession(sessionId) {
   });
 }
 
-// Tool Handlers - Individual functions for each tool
+// ============================================================
+// Tool Handlers
+// ============================================================
+
 async function handleStatus() {
   const status = await getStatus();
   return JSON.stringify(status, null, 2);
 }
 
-async function handleClaudeCode(args) {
-  if (!args?.description) {
+async function handleClaudeCode(toolArgs) {
+  if (!toolArgs?.description) {
     return '❌ Error: No task description provided';
   }
   if (currentTask?.status === 'running') {
-    return '❌ Error: A Claude Code task is already running. Use "claude-abort" to cancel or "claude-continue" to get result.';
+    return '❌ Error: A Claude Code task is already running.';
   }
   
-  const result = await runClaudeCodeInteractive(args.description);
-  return result;
+  return await runClaudeCodeInteractive(toolArgs.description);
 }
 
-async function handleClaudeContinue(args) {
-  // If sessionId provided, continue that specific session
-  if (args?.sessionId) {
-    const userInput = args?.input || '';
-    const result = await continueClaudeSession(args.sessionId, userInput);
-    return result;
+async function handleClaudeContinue(toolArgs) {
+  if (toolArgs?.sessionId) {
+    return await continueClaudeSession(toolArgs.sessionId, toolArgs?.input || '');
   }
   
-  // If currentSessionId exists, continue most recent interactive session
   if (currentSessionId && activeSessions.has(currentSessionId)) {
-    const userInput = args?.input || '';
-    const result = await continueClaudeSession(currentSessionId, userInput);
-    return result;
+    return await continueClaudeSession(currentSessionId, toolArgs?.input || '');
   }
   
-  return '❌ No active session to continue. Use claude-sessions to see available sessions.';
+  return '❌ No active session to continue.';
 }
 
-async function handleClaudeForce(args) {
-  // If sessionId provided, force that specific session
-  if (args?.sessionId) {
-    const result = await forceClaudeSession(args.sessionId);
-    return result;
+async function handleClaudeForce(toolArgs) {
+  if (toolArgs?.sessionId) {
+    return await forceClaudeSession(toolArgs.sessionId);
   }
   
-  // If currentSessionId exists, force most recent session
   if (currentSessionId && activeSessions.has(currentSessionId)) {
-    const result = await forceClaudeSession(currentSessionId);
-    return result;
+    return await forceClaudeSession(currentSessionId);
   }
   
-  return '❌ No active session to force execute. Use claude-sessions to see available sessions.';
+  return '❌ No active session to force execute.';
 }
 
 async function handleClaudeSessions() {
@@ -922,112 +838,105 @@ async function handleClaudeAbort() {
   return '❌ No running task to abort';
 }
 
-
-// File Operation Handlers
-async function handleStrReplace(args) {
+// File operation handlers
+async function handleStrReplace(toolArgs) {
   try {
-    const { readFileSync, writeFileSync } = await import('fs');
-    if (!args?.path || !args?.old_str) {
+    if (!toolArgs?.path || !toolArgs?.old_str) {
       return '❌ Error: path and old_str are required';
     }
-    const absolutePath = validatePath(args.path);
+    const absolutePath = validatePath(toolArgs.path);
     const content = readFileSync(absolutePath, 'utf-8');
-    const occurrences = content.split(args.old_str).length - 1;
-    if (occurrences === 0) return `❌ Error: old_str not found in ${args.path}`;
-    if (occurrences > 1) return `❌ Error: old_str appears ${occurrences} times in ${args.path} (must be unique)`;
-    const newContent = content.replace(args.old_str, args.new_str || '');
+    const occurrences = content.split(toolArgs.old_str).length - 1;
+    if (occurrences === 0) return `❌ Error: old_str not found in ${toolArgs.path}`;
+    if (occurrences > 1) return `❌ Error: old_str appears ${occurrences} times (must be unique)`;
+    const newContent = content.replace(toolArgs.old_str, toolArgs.new_str || '');
     writeFileSync(absolutePath, newContent, 'utf-8');
-    return `✓ File edited: ${args.path}`;
+    return `✓ File edited: ${toolArgs.path}`;
   } catch (err) {
     return `❌ Error: ${err.message}`;
   }
 }
 
-async function handleFileCreate(args) {
+async function handleFileCreate(toolArgs) {
   try {
-    const { writeFileSync, mkdirSync, existsSync } = await import('fs');
-    const { dirname } = await import('path');
-    if (!args?.path || args?.file_text === undefined) {
+    if (!toolArgs?.path || toolArgs?.file_text === undefined) {
       return '❌ Error: path and file_text are required';
     }
-    const absolutePath = validatePath(args.path);
+    const absolutePath = validatePath(toolArgs.path);
     const dir = dirname(absolutePath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    writeFileSync(absolutePath, args.file_text, 'utf-8');
-    return `✓ File created: ${args.path}`;
+    writeFileSync(absolutePath, toolArgs.file_text, 'utf-8');
+    return `✓ File created: ${toolArgs.path}`;
   } catch (err) {
     return `❌ Error: ${err.message}`;
   }
 }
 
-async function handleFileDelete(args) {
+async function handleFileDelete(toolArgs) {
   try {
-    const { unlinkSync, existsSync, statSync } = await import('fs');
-    if (!args?.path) return '❌ Error: path is required';
-    const absolutePath = validatePath(args.path);
-    if (!existsSync(absolutePath)) return `❌ Error: ${args.path} does not exist`;
-    if (statSync(absolutePath).isDirectory()) return `❌ Error: ${args.path} is a directory. Only files can be deleted.`;
+    const { unlinkSync, statSync } = await import('fs');
+    if (!toolArgs?.path) return '❌ Error: path is required';
+    const absolutePath = validatePath(toolArgs.path);
+    if (!existsSync(absolutePath)) return `❌ Error: ${toolArgs.path} does not exist`;
+    if (statSync(absolutePath).isDirectory()) return `❌ Error: ${toolArgs.path} is a directory`;
     unlinkSync(absolutePath);
-    return `✓ File deleted: ${args.path}`;
+    return `✓ File deleted: ${toolArgs.path}`;
   } catch (err) {
     return `❌ Error: ${err.message}`;
   }
 }
 
-async function handleFileMove(args) {
+async function handleFileMove(toolArgs) {
   try {
-    const { renameSync, existsSync, mkdirSync } = await import('fs');
-    const { dirname } = await import('path');
-    if (!args?.source || !args?.destination) return '❌ Error: source and destination are required';
-    const absoluteSource = validatePath(args.source);
-    const absoluteDestination = validatePath(args.destination);
-    if (!existsSync(absoluteSource)) return `❌ Error: ${args.source} does not exist`;
-    if (existsSync(absoluteDestination)) return `❌ Error: ${args.destination} already exists`;
+    const { renameSync } = await import('fs');
+    if (!toolArgs?.source || !toolArgs?.destination) return '❌ Error: source and destination required';
+    const absoluteSource = validatePath(toolArgs.source);
+    const absoluteDestination = validatePath(toolArgs.destination);
+    if (!existsSync(absoluteSource)) return `❌ Error: ${toolArgs.source} does not exist`;
+    if (existsSync(absoluteDestination)) return `❌ Error: ${toolArgs.destination} already exists`;
     const destDir = dirname(absoluteDestination);
     if (!existsSync(destDir)) mkdirSync(destDir, { recursive: true });
     renameSync(absoluteSource, absoluteDestination);
-    return `✓ Moved: ${args.source} → ${args.destination}`;
+    return `✓ Moved: ${toolArgs.source} → ${toolArgs.destination}`;
   } catch (err) {
     return `❌ Error: ${err.message}`;
   }
 }
 
-async function handleMkdir(args) {
+async function handleMkdir(toolArgs) {
   try {
-    const { mkdirSync, existsSync } = await import('fs');
-    if (!args?.path) return '❌ Error: path is required';
-    const absolutePath = validatePath(args.path);
-    if (existsSync(absolutePath)) return `❌ Error: ${args.path} already exists`;
-    const recursive = args.recursive !== false;
-    mkdirSync(absolutePath, { recursive });
-    return `✓ Directory created: ${args.path}`;
+    if (!toolArgs?.path) return '❌ Error: path is required';
+    const absolutePath = validatePath(toolArgs.path);
+    if (existsSync(absolutePath)) return `❌ Error: ${toolArgs.path} already exists`;
+    mkdirSync(absolutePath, { recursive: toolArgs.recursive !== false });
+    return `✓ Directory created: ${toolArgs.path}`;
   } catch (err) {
     return `❌ Error: ${err.message}`;
   }
 }
 
-async function handleRmdir(args) {
+async function handleRmdir(toolArgs) {
   try {
-    const { rmdirSync, existsSync, statSync, readdirSync } = await import('fs');
-    if (!args?.path) return '❌ Error: path is required';
-    const absolutePath = validatePath(args.path);
-    if (!existsSync(absolutePath)) return `❌ Error: ${args.path} does not exist`;
-    if (!statSync(absolutePath).isDirectory()) return `❌ Error: ${args.path} is not a directory`;
+    const { rmdirSync, statSync, readdirSync } = await import('fs');
+    if (!toolArgs?.path) return '❌ Error: path is required';
+    const absolutePath = validatePath(toolArgs.path);
+    if (!existsSync(absolutePath)) return `❌ Error: ${toolArgs.path} does not exist`;
+    if (!statSync(absolutePath).isDirectory()) return `❌ Error: ${toolArgs.path} is not a directory`;
     const contents = readdirSync(absolutePath);
-    if (contents.length > 0) return `❌ Error: ${args.path} is not empty (contains ${contents.length} items). Only empty directories can be removed.`;
+    if (contents.length > 0) return `❌ Error: ${toolArgs.path} is not empty`;
     rmdirSync(absolutePath);
-    return `✓ Directory removed: ${args.path}`;
+    return `✓ Directory removed: ${toolArgs.path}`;
   } catch (err) {
     return `❌ Error: ${err.message}`;
   }
 }
 
-async function handleView(args) {
+async function handleView(toolArgs) {
   try {
-    const { readFileSync, readdirSync, statSync, existsSync } = await import('fs');
-    if (!args?.path) return '❌ Error: path is required';
-    const absolutePath = validatePath(args.path);
-    if (!existsSync(absolutePath)) return `❌ Error: ${args.path} does not exist`;
+    const { readdirSync, statSync } = await import('fs');
+    if (!toolArgs?.path) return '❌ Error: path is required';
+    const absolutePath = validatePath(toolArgs.path);
+    if (!existsSync(absolutePath)) return `❌ Error: ${toolArgs.path} does not exist`;
     const stats = statSync(absolutePath);
     if (stats.isDirectory()) {
       const entries = readdirSync(absolutePath, { withFileTypes: true });
@@ -1036,8 +945,8 @@ async function handleView(args) {
     } else {
       const content = readFileSync(absolutePath, 'utf-8');
       const lines = content.split('\n');
-      if (args.lines && Array.isArray(args.lines) && args.lines.length === 2) {
-        let [start, end] = args.lines;
+      if (toolArgs.lines && Array.isArray(toolArgs.lines) && toolArgs.lines.length === 2) {
+        let [start, end] = toolArgs.lines;
         start = Math.max(1, start);
         end = end === -1 ? lines.length : Math.min(end, lines.length);
         return lines.slice(start - 1, end).map((line, i) => `${start + i}: ${line}`).join('\n');
@@ -1049,17 +958,17 @@ async function handleView(args) {
   }
 }
 
-async function handleGrep(args) {
+async function handleGrep(toolArgs) {
   try {
-    const { readFileSync, readdirSync, statSync, existsSync } = await import('fs');
-    const { join } = await import('path');
-    if (!args?.path || !args?.pattern) return '❌ Error: path and pattern are required';
-    const absolutePath = validatePath(args.path);
-    if (!existsSync(absolutePath)) return `❌ Error: ${args.path} does not exist`;
-    const flags = args.ignoreCase ? 'gi' : 'g';
-    const regex = new RegExp(args.pattern, flags);
+    const { readdirSync, statSync } = await import('fs');
+    if (!toolArgs?.path || !toolArgs?.pattern) return '❌ Error: path and pattern required';
+    const absolutePath = validatePath(toolArgs.path);
+    if (!existsSync(absolutePath)) return `❌ Error: ${toolArgs.path} does not exist`;
+    const flags = toolArgs.ignoreCase ? 'gi' : 'g';
+    const regex = new RegExp(toolArgs.pattern, flags);
     const results = [];
-    const maxResults = args.maxResults || 100;
+    const maxResults = toolArgs.maxResults || 100;
+    
     function searchFile(filePath, displayPath) {
       try {
         const content = readFileSync(filePath, 'utf-8');
@@ -1069,30 +978,32 @@ async function handleGrep(args) {
             results.push(`${displayPath}:${index + 1}: ${line.trim()}`);
           }
         });
-      } catch (err) {}
+      } catch {}
     }
+    
     function searchDirectory(dirPath, displayPrefix = '') {
       const entries = readdirSync(dirPath, { withFileTypes: true });
       for (const entry of entries) {
         if (results.length >= maxResults) break;
         const fullPath = join(dirPath, entry.name);
         const displayPath = displayPrefix ? `${displayPrefix}/${entry.name}` : entry.name;
-        if (entry.isDirectory() && args.recursive) {
+        if (entry.isDirectory() && toolArgs.recursive) {
           searchDirectory(fullPath, displayPath);
         } else if (entry.isFile()) {
-          if (args.filePattern) {
-            const fileRegex = new RegExp(args.filePattern);
+          if (toolArgs.filePattern) {
+            const fileRegex = new RegExp(toolArgs.filePattern);
             if (!fileRegex.test(entry.name)) continue;
           }
           searchFile(fullPath, displayPath);
         }
       }
     }
+    
     const stats = statSync(absolutePath);
     if (stats.isDirectory()) {
-      searchDirectory(absolutePath, args.path);
+      searchDirectory(absolutePath, toolArgs.path);
     } else {
-      searchFile(absolutePath, args.path);
+      searchFile(absolutePath, toolArgs.path);
     }
     return results.length > 0 ? results.join('\n') : 'No matches found';
   } catch (err) {
@@ -1100,432 +1011,28 @@ async function handleGrep(args) {
   }
 }
 
-async function handleToolCall(name, args) {
-  const handlers = {
-    'status': handleStatus,
-    'claude-code': handleClaudeCode,
-    'claude-continue': handleClaudeContinue,
-    'claude-force': handleClaudeForce,
-    'claude-sessions': handleClaudeSessions,
-    'claude-abort': handleClaudeAbort,
-    'str_replace': handleStrReplace,
-    'file_create': handleFileCreate,
-    'file_delete': handleFileDelete,
-    'file_move': handleFileMove,
-    'mkdir': handleMkdir,
-    'rmdir': handleRmdir,
-    'view': handleView,
-    'grep': handleGrep
-  };
-  
-  if (handlers[name]) {
-    return await handlers[name](args);
-  }
-
-  // unity-editor - Call Unity Editor MCP tool
-  if (name === 'unity-editor') {
-    if (!args?.tool) {
-      return '❌ Error: tool parameter is required';
-    }
-    const result = await callUnityMCPForTool('editor', args.tool, args.args || {});
-    
-    // If entering Play Mode, wait for it to be ready
-    if (args.tool === 'play' && result.includes('Entering Play Mode')) {
-      await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
-      return result + ' (waiting for Game MCP to start...)';
-    }
-    
-    return result;
-  }
-  
-  // unity-game - Call Unity Game MCP tool
-  if (name === 'unity-game') {
-    if (!args?.tool) {
-      return '❌ Error: tool parameter is required';
-    }
-    return await callUnityMCPForTool('game', args.tool, args.args || {});
-  }
-  
-  // unity-tools - List all Unity MCP tools
-  if (name === 'unity-tools') {
-    return await listUnityToolsFormatted();
-  }
-  
-  // Unknown tool
-  return `⚠️ Unknown tool: ${name}`;
-}
-
-// Send admin command over WebSocket
-async function checkAdminStatus() {
-  return new Promise((resolve) => {
-    if (!currentWs || currentWs.readyState !== 1) {
-      resolve(false);
-      return;
-    }
-    
-    adminCheckInProgress = true; // Suppress error logging
-    
-    const id = crypto.randomUUID();
-    const adminRequest = {
-      type: 'admin',
-      id: id,
-      args: { subcommand: 'user-list' }
-    };
-    
-    let timeoutHandle = null;
-    
-    const originalOnMessage = currentWs.onmessage;
-    const messageHandler = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'admin_response' && msg.id === id) {
-          clearTimeout(timeoutHandle);
-          currentWs.onmessage = originalOnMessage;
-          adminCheckInProgress = false; // Re-enable error logging
-          // If no error, we have admin access
-          resolve(!msg.error);
-        }
-      } catch (e) {
-        if (originalOnMessage) {
-          originalOnMessage(event);
-        }
-      }
-    };
-    
-    currentWs.onmessage = messageHandler;
-    currentWs.send(JSON.stringify(adminRequest));
-    
-    timeoutHandle = setTimeout(() => {
-      currentWs.onmessage = originalOnMessage;
-      adminCheckInProgress = false; // Re-enable error logging
-      resolve(false);
-    }, 2000);
-  });
-}
-
-function sendAdminCommand(subcommand, nodeId, makeAdmin) {
-  return new Promise((resolve) => {
-    if (!currentWs || currentWs.readyState !== 1) {
-      console.log('\n  ❌ Not connected to relay');
-      resolve();
-      return;
-    }
-    
-    const id = crypto.randomUUID();
-    const adminRequest = {
-      type: 'admin',
-      id: id,
-      args: {
-        subcommand: subcommand,
-        nodeId: nodeId,
-        isAdmin: makeAdmin
-      }
-    };
-    
-    console.log(`\n  👑 Admin: ${subcommand}${nodeId ? ` ${nodeId}` : ''}${makeAdmin ? ' (admin)' : ''}`);
-    
-    let timeoutHandle = null;
-    
-    // Set up response handler
-    const originalOnMessage = currentWs.onmessage;
-    const messageHandler = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'admin_response' && msg.id === id) {
-          clearTimeout(timeoutHandle); // Clear timeout on response
-          if (msg.error) {
-            console.log(`\n  ❌ ${msg.error}\n`);
-          } else {
-            console.log(`\n${msg.result}\n`);
-          }
-          // Restore original handler
-          currentWs.onmessage = originalOnMessage;
-          resolve();
-        }
-      } catch (e) {
-        // Not for us, let original handler deal with it
-        if (originalOnMessage) {
-          originalOnMessage(event);
-        }
-      }
-    };
-    
-    currentWs.onmessage = messageHandler;
-    currentWs.send(JSON.stringify(adminRequest));
-    
-    // Timeout after 5 seconds
-    timeoutHandle = setTimeout(() => {
-      currentWs.onmessage = originalOnMessage;
-      console.log('\n  ⏱️  Admin command timeout\n');
-      resolve();
-    }, 5000);
-  });
-}
-
-function connect(token) {
-  const ws = new WebSocket(RELAY_URL, {
-    headers: {
-      'Authorization': `Bearer ${token}`
-    }
-  });
-
-  currentWs = ws; // Store globally for admin commands
-
-  ws.on('open', async () => {
-    console.log('  ✓ Connected to relay. Waiting for tasks...\n');
-    console.log('  ' + '─'.repeat(50) + '\n');
-    
-    // Check admin status
-    isAdminNode = await checkAdminStatus();
-    if (isAdminNode) {
-      console.log('  👑 Admin privileges detected\n');
-    }
-    
-    // Start interactive CLI after successful connection
-    startInteractiveCLI();
-  });
-
-  ws.on('message', async (data) => {
-    try {
-      const msg = JSON.parse(data);
-      
-      // Handle error messages from relay (but not during admin check)
-      if (msg.error && !adminCheckInProgress) {
-        console.error('\n  ❌ ERROR FROM RELAY:');
-        console.error('     ' + (msg.error || msg.message || 'Unknown error'));
-        return;
-      }
-      
-      if (msg.method === 'tools/call') {
-        const toolName = msg.params?.name;
-        const toolArgs = msg.params?.arguments || {};
-        
-        // Format args nicely with proper newlines
-        const formattedArgs = {};
-        for (const [key, val] of Object.entries(toolArgs)) {
-          if (typeof val === 'string' && val.includes('\n')) {
-            formattedArgs[key] = val; // Keep original for display
-          } else {
-            formattedArgs[key] = val;
-          }
-        }
-        
-        // Log call with formatted arguments
-        console.log(`\n  📞 Call: ${toolName}`);
-        if (Object.keys(formattedArgs).length > 0) {
-          console.log('  Arguments:');
-          for (const [key, val] of Object.entries(formattedArgs)) {
-            if (typeof val === 'string' && val.includes('\n')) {
-              console.log(`    ${key}:`);
-              val.split('\n').forEach(line => console.log(`      ${line}`));
-            } else {
-              console.log(`    ${key}: ${JSON.stringify(val)}`);
-            }
-          }
-        }
-        
-        const result = await handleToolCall(toolName, toolArgs);
-        
-        // Log nicely formatted response
-        if (toolName === 'task' && currentTask && currentTask.status !== 'running') {
-          // Task completion - show full formatted output
-          console.log(`\n  📤 Response:\n`);
-          const formatted = result.replace(/\\n/g, '\n');
-          console.log('  ' + formatted.replace(/\n/g, '\n  '));
-          console.log('');
-        } else {
-          // Other tools - show formatted response
-          console.log(`\n  📤 Response:`);
-          const formatted = result.replace(/\\n/g, '\n');
-          formatted.split('\n').forEach(line => console.log(`  ${line}`));
-          console.log('');
-        }
-        
-        ws.send(JSON.stringify({
-          id: msg.id,
-          result: { content: [{ type: 'text', text: result }] }
-        }));
-        
-        // Refresh prompt after response
-        if (readlineInterface) {
-          readlineInterface.prompt();
-        }
-      }
-    } catch (e) {
-      console.error('  ❌ Error:', e.message);
-    }
-  });
-
-  ws.on('close', (code, reason) => {
-    currentWs = null; // Clear global reference
-    const reasonText = reason?.toString() || '';
-    if (code === 1008) {
-      console.log('\n  ❌ AUTHENTICATION FAILED: ' + reasonText);
-      console.log('  Check your token.\n');
-      process.exit(1);
-    } else {
-      console.log('\n  ⚠️ Disconnected' + (reasonText ? ': ' + reasonText : '') + '. Reconnecting in 5s...');
-      setTimeout(() => connect(token), 5000);
-    }
-  });
-
-  ws.on('error', (err) => {
-    console.error('  ❌ Connection error:', err.message);
-  });
-}
-
-// Helper to call Unity MCP servers directly
-async function callUnityMCP(server, tool, args) {
+// Unity MCP handlers
+async function callUnityMCPForTool(server, tool, toolArgs) {
   const port = server === 'editor' ? UNITY_EDITOR_PORT : UNITY_GAME_PORT;
   const url = `http://localhost:${port}/mcp`;
   
   try {
-    const headers = { 'Content-Type': 'application/json' };
-    if (UNITY_SECRET) {
-      headers['Authorization'] = `Bearer ${UNITY_SECRET}`;
-    }
-    
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+    const timeout = setTimeout(() => controller.abort(), 10000);
     
     const response = await fetch(url, {
       method: 'POST',
-      headers: headers,
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         jsonrpc: '2.0',
         id: Date.now(),
         method: 'tools/call',
-        params: {
-          name: tool,
-          arguments: args
-        }
+        params: { name: tool, arguments: toolArgs }
       }),
       signal: controller.signal
     });
     
     clearTimeout(timeout);
-    
-    if (response.status === 401) {
-      console.log(`  ❌ Authentication failed: Unity MCP requires secret token`);
-      console.log(`  Set UNITY_MCP_SECRET environment variable`);
-      return;
-    }
-    
-    const data = await response.json();
-    
-    if (data.error) {
-      console.log(`  ❌ Error: ${data.error.message}`);
-      return;
-    }
-    
-    if (data.result?.content) {
-      const content = data.result.content;
-      if (Array.isArray(content) && content.length > 0) {
-        console.log(`  ✅ ${content[0].text}`);
-      } else {
-        console.log('  ✅ Done');
-      }
-    }
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      console.log(`  ❌ Timeout: Unity MCP server on port ${port} did not respond within 10 seconds`);
-    } else {
-      console.log(`  ❌ Connection failed: ${err.message}`);
-      console.log(`  Make sure Unity MCP server is running on port ${port}`);
-    }
-  }
-}
-
-// List all available Unity MCP tools
-async function listUnityTools() {
-  const servers = [
-    { name: 'Unity Editor', port: UNITY_EDITOR_PORT },
-    { name: 'Unity Game', port: UNITY_GAME_PORT }
-  ];
-  
-  for (const { name, port } of servers) {
-    try {
-      const response = await fetch(`http://localhost:${port}/mcp`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: Date.now(),
-          method: 'tools/list'
-        })
-      });
-      
-      const data = await response.json();
-      
-      if (data.error) {
-        console.log(`  ❌ ${name} (port ${port}): ${data.error.message}`);
-        continue;
-      }
-      
-      const tools = data.result?.tools || [];
-      console.log(`  📦 ${name} (port ${port}):`);
-      console.log('  ' + '─'.repeat(50));
-      
-      if (tools.length === 0) {
-        console.log('    No tools available');
-      } else {
-        for (const tool of tools) {
-          console.log(`    • ${tool.name}`);
-          console.log(`      ${tool.description}`);
-          
-          // Show parameters if any
-          const props = tool.inputSchema?.properties;
-          if (props && Object.keys(props).length > 0) {
-            const params = Object.keys(props).map(key => {
-              const required = tool.inputSchema?.required?.includes(key);
-              return required ? `${key}*` : key;
-            }).join(', ');
-            console.log(`      Parameters: ${params}`);
-          }
-        }
-      }
-      console.log('');
-    } catch (err) {
-      console.log(`  ❌ ${name} (port ${port}): Connection failed`);
-      console.log(`     ${err.message}\n`);
-    }
-  }
-}
-
-// Helper function to call Unity MCP and return formatted result
-async function callUnityMCPForTool(server, tool, args) {
-  const port = server === 'editor' ? UNITY_EDITOR_PORT : UNITY_GAME_PORT;
-  const url = `http://localhost:${port}/mcp`;
-  
-  try {
-    const headers = { 'Content-Type': 'application/json' };
-    if (UNITY_SECRET) {
-      headers['Authorization'] = `Bearer ${UNITY_SECRET}`;
-    }
-    
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: Date.now(),
-        method: 'tools/call',
-        params: {
-          name: tool,
-          arguments: args
-        }
-      }),
-      signal: controller.signal
-    });
-    
-    clearTimeout(timeout);
-    
-    if (response.status === 401) {
-      return `❌ Authentication failed: Unity MCP requires secret token. Set UNITY_MCP_SECRET environment variable.`;
-    }
     
     const data = await response.json();
     
@@ -1544,13 +1051,12 @@ async function callUnityMCPForTool(server, tool, args) {
     return 'Done';
   } catch (err) {
     if (err.name === 'AbortError') {
-      return `❌ Timeout: Unity MCP server on port ${port} did not respond within 10 seconds`;
+      return `❌ Timeout: Unity MCP server on port ${port} did not respond`;
     }
-    return `❌ Connection failed: ${err.message}\nMake sure Unity MCP server is running on port ${port}`;
+    return `❌ Connection failed: ${err.message}`;
   }
 }
 
-// Helper function to list Unity tools and return as formatted string
 async function listUnityToolsFormatted() {
   const servers = [
     { name: 'Unity Editor', port: UNITY_EDITOR_PORT },
@@ -1588,8 +1094,6 @@ async function listUnityToolsFormatted() {
         for (const tool of tools) {
           output += `  • ${tool.name}\n`;
           output += `    ${tool.description}\n`;
-          
-          // Show parameters if any
           const props = tool.inputSchema?.properties;
           if (props && Object.keys(props).length > 0) {
             const params = Object.keys(props).map(key => {
@@ -1603,14 +1107,166 @@ async function listUnityToolsFormatted() {
       output += '\n';
     } catch (err) {
       output += `❌ ${name} (port ${port}): Connection failed\n`;
-      output += `   ${err.message}\n\n`;
     }
   }
   
   return output;
 }
 
+async function handleToolCall(name, toolArgs) {
+  const handlers = {
+    'status': handleStatus,
+    'claude-code': handleClaudeCode,
+    'claude-continue': handleClaudeContinue,
+    'claude-force': handleClaudeForce,
+    'claude-sessions': handleClaudeSessions,
+    'claude-abort': handleClaudeAbort,
+    'str_replace': handleStrReplace,
+    'file_create': handleFileCreate,
+    'file_delete': handleFileDelete,
+    'file_move': handleFileMove,
+    'mkdir': handleMkdir,
+    'rmdir': handleRmdir,
+    'view': handleView,
+    'grep': handleGrep
+  };
+  
+  if (handlers[name]) {
+    return await handlers[name](toolArgs);
+  }
+
+  if (name === 'unity-editor') {
+    if (!toolArgs?.tool) return '❌ Error: tool parameter is required';
+    return await callUnityMCPForTool('editor', toolArgs.tool, toolArgs.args || {});
+  }
+  
+  if (name === 'unity-game') {
+    if (!toolArgs?.tool) return '❌ Error: tool parameter is required';
+    return await callUnityMCPForTool('game', toolArgs.tool, toolArgs.args || {});
+  }
+  
+  if (name === 'unity-tools') {
+    return await listUnityToolsFormatted();
+  }
+  
+  return `⚠️ Unknown tool: ${name}`;
+}
+
+// ============================================================
+// SSE Connection to Relay
+// ============================================================
+
+async function connectToRelay() {
+  console.log(`\n  📡 Connecting to ${RELAY_URL}/node ...`);
+  
+  const response = await fetch(`${RELAY_URL}/node`, {
+    headers: {
+      'Authorization': `Bearer ${currentIdToken}`,
+      'Accept': 'text/event-stream'
+    }
+  });
+  
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Connection failed: ${response.status} - ${text}`);
+  }
+  
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  
+  console.log('  ✓ Connected to relay\n');
+  console.log('  ' + '─'.repeat(50) + '\n');
+  
+  // Start interactive CLI
+  startInteractiveCLI();
+  
+  while (true) {
+    const { done, value } = await reader.read();
+    
+    if (done) {
+      console.log('\n  ✗ Connection closed, reconnecting...');
+      break;
+    }
+    
+    buffer += decoder.decode(value, { stream: true });
+    
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    
+    let currentEvent = null;
+    let currentData = '';
+    
+    for (const line of lines) {
+      if (line.startsWith('event:')) {
+        currentEvent = line.slice(6).trim();
+      } else if (line.startsWith('data:')) {
+        currentData = line.slice(5).trim();
+      } else if (line === '' && currentEvent && currentData) {
+        await handleSSEEvent(currentEvent, currentData);
+        currentEvent = null;
+        currentData = '';
+      }
+    }
+  }
+}
+
+async function handleSSEEvent(event, data) {
+  if (event === 'connected') {
+    // Node registered, no action needed
+  } else if (event === 'ping') {
+    // Keepalive, refresh token if needed
+    await refreshTokenIfNeeded();
+  } else if (event === 'request') {
+    const request = JSON.parse(data);
+    await handleToolRequest(request);
+  }
+}
+
+async function handleToolRequest(request) {
+  const { id: requestId, method, params } = request;
+  const toolName = params?.name;
+  const toolArgs = params?.arguments || {};
+  
+  console.log(`\n  📞 Call: ${toolName}`);
+  if (Object.keys(toolArgs).length > 0) {
+    console.log('  Arguments:', JSON.stringify(toolArgs, null, 2).replace(/\n/g, '\n  '));
+  }
+  
+  let result;
+  try {
+    result = await handleToolCall(toolName, toolArgs);
+  } catch (err) {
+    result = `⚠️ Error: ${err.message}`;
+  }
+  
+  console.log(`\n  📤 Response:`);
+  result.split('\n').forEach(line => console.log(`  ${line}`));
+  console.log('');
+  
+  // Send response back to relay
+  try {
+    await fetch(`${RELAY_URL}/node?requestId=${requestId}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${currentIdToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ result: { content: [{ type: 'text', text: result }] } })
+    });
+  } catch (err) {
+    console.error(`  ❌ Failed to send response: ${err.message}`);
+  }
+  
+  if (readlineInterface) {
+    readlineInterface.prompt();
+  }
+}
+
+// ============================================================
 // Interactive CLI
+// ============================================================
+
 function startInteractiveCLI() {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -1618,7 +1274,7 @@ function startInteractiveCLI() {
     prompt: 'AIRON> '
   });
   
-  readlineInterface = rl; // Store globally for WebSocket handler
+  readlineInterface = rl;
 
   console.log('  💬 Interactive mode enabled. Type "help" for commands.\n');
   rl.prompt();
@@ -1633,7 +1289,7 @@ function startInteractiveCLI() {
 
     const parts = input.split(' ');
     const command = parts[0].toLowerCase();
-    const args = parts.slice(1).join(' ');
+    const commandArgs = parts.slice(1).join(' ');
 
     switch (command) {
       case 'help':
@@ -1642,87 +1298,16 @@ function startInteractiveCLI() {
         console.log('  ─────────────────────────────────────────');
         console.log('  status                     - Check Unity and MCP server status');
         console.log('  claude-sessions            - List active Claude Code sessions');
-        console.log('  claude-code <description>  - Run Claude Code task (interactive mode)');
-        console.log('  claude-continue [input]    - Continue session with input/after timeout');
-        console.log('  claude-force               - Approve and force execute with full permissions');
-        console.log('  claude-abort               - Abort current running Claude Code task');
+        console.log('  claude-code <description>  - Run Claude Code task');
+        console.log('  claude-continue [input]    - Continue session');
+        console.log('  claude-force               - Force execute with full permissions');
+        console.log('  claude-abort               - Abort current task');
         console.log('  unity-editor <tool> [args] - Call Unity Editor MCP tool');
         console.log('  unity-game <tool> [args]   - Call Unity Game MCP tool');
-        console.log('  unity-tools                - List all available Unity MCP tools');
-        if (isAdminNode) {
-          console.log('  admin <subcommand>         - Admin commands (user-list, user-add, user-delete)');
-        }
+        console.log('  unity-tools                - List Unity MCP tools');
         console.log('  help                       - Show this help');
         console.log('  exit                       - Exit AIRON');
         console.log('');
-        console.log('  Examples:');
-        console.log('  claude-code create a player controller');
-        console.log('  claude-continue Focus on WASD movement');
-        console.log('  claude-force');
-        console.log('  unity-editor play');
-        console.log('  unity-editor viewlog lines=[1,100]');
-        console.log('  unity-game execute script="return 2+2"');
-        if (isAdminNode) {
-          console.log('  admin user-list');
-          console.log('  admin user-add <username> <secret>');
-          console.log('  admin user-add <username> <secret> --admin');
-          console.log('  admin user-delete <username> <secret>');
-          console.log('');
-          console.log('  Note: MCP URL format is https://dev.airon.games/mcp/<username>/<secret>');
-        }
-        console.log('');
-        break;
-
-      case 'admin':
-        if (!isAdminNode) {
-          console.log('\n  ❌ Admin access required\n');
-          break;
-        }
-        if (!args) {
-          console.log('\n  ❌ Usage: admin <subcommand> [arguments]');
-          console.log('  Subcommands:');
-          console.log('    user-list                         - List all nodes and their status');
-          console.log('    user-add <username> <secret>      - Add a new node');
-          console.log('    user-add <username> <secret> --admin - Add a new admin node');
-          console.log('    user-delete <username> <secret>   - Remove a node');
-          console.log('');
-          console.log('  Examples:');
-          console.log('    admin user-add alice AbCdEfGh1234567890');
-          console.log('    admin user-add bob XyZaBcDeFg1234567890 --admin');
-          console.log('    admin user-delete charlie PqRsTuVwXyZ1234567890');
-          console.log('');
-          console.log('  MCP connector URL format:');
-          console.log('    https://dev.airon.games/mcp/<username>/<secret>');
-          console.log('');
-        } else {
-          const adminParts = args.split(' ');
-          const subcommand = adminParts[0];
-          const username = adminParts[1];
-          const secret = adminParts[2];
-          const makeAdmin = adminParts.includes('--admin');
-          
-          // Build nodeId from username and secret
-          let nodeId;
-          if (subcommand === 'user-add') {
-            if (!username || !secret) {
-              console.log('\n  ❌ Usage: admin user-add <username> <secret> [--admin]');
-              console.log('  Example: admin user-add alice AbCdEfGh1234567890\n');
-              break;
-            }
-            nodeId = `${username}:${secret}`;
-          } else if (subcommand === 'user-delete') {
-            if (!username || !secret) {
-              console.log('\n  ❌ Usage: admin user-delete <username> <secret>');
-              console.log('  Example: admin user-delete bob XyZaBcDeFg1234567890\n');
-              break;
-            }
-            nodeId = `${username}:${secret}`;
-          } else {
-            nodeId = username; // For other commands if any
-          }
-          
-          await sendAdminCommand(subcommand, nodeId, makeAdmin);
-        }
         break;
 
       case 'status':
@@ -1732,68 +1317,52 @@ function startInteractiveCLI() {
         break;
 
       case 'claude-sessions':
-      case 'sessions': // Support old name for backward compatibility
+      case 'sessions':
         console.log('');
         if (activeSessions.size === 0) {
           console.log('  No active sessions');
         } else {
           console.log('  Active Claude Code Sessions:');
-          console.log('  ─────────────────────────────────────────');
           for (const [id, session] of activeSessions) {
             const current = id === currentSessionId ? ' [CURRENT]' : '';
             console.log(`  ${id}${current}`);
             console.log(`    Status: ${session.status}`);
-            console.log(`    Started: ${session.started}`);
-            if (session.finished) {
-              console.log(`    Finished: ${session.finished}`);
-            }
-            console.log('');
           }
         }
         console.log('');
         break;
 
       case 'claude-code':
-        if (!args) {
+        if (!commandArgs) {
           console.log('\n  ❌ Usage: claude-code <description>');
-          console.log('  Example: claude-code enter Unity play mode');
         } else {
-          console.log(`\n  🤖 Running Claude Code (interactive): ${args}`);
-          await runClaudeCodeInteractive(args);
+          await runClaudeCodeInteractive(commandArgs);
         }
         break;
 
       case 'claude-continue':
         if (currentSessionId && activeSessions.has(currentSessionId)) {
-          const input = args || '';
-          if (input) {
-            console.log(`\n  ▶️  Continuing session with input: ${input}`);
-          } else {
-            console.log(`\n  ▶️  Continuing session...`);
-          }
-          await continueClaudeSession(currentSessionId, input);
+          await continueClaudeSession(currentSessionId, commandArgs || '');
         } else {
           console.log('\n  ⚠️  No active session to continue');
         }
         break;
 
       case 'claude-force':
-      case 'force': // Support short name
+      case 'force':
         if (currentSessionId && activeSessions.has(currentSessionId)) {
-          console.log(`\n  ⚡ Forcing execution of session...`);
           await forceClaudeSession(currentSessionId);
         } else {
-          console.log('\n  ⚠️  No active session to force execute');
+          console.log('\n  ⚠️  No active session to force');
         }
         break;
 
       case 'claude-abort':
-      case 'abort': // Support old name for backward compatibility
+      case 'abort':
         if (!currentProcess) {
-          console.log('\n  ⚠️  No task is currently running');
+          console.log('\n  ⚠️  No task running');
         } else {
-          console.log('\n  🛑 Aborting current task...');
-          isAborted = true; // Set flag before killing
+          isAborted = true;
           if (platform() === 'win32') {
             spawn('taskkill', ['/pid', currentProcess.pid, '/f', '/t']);
           } else {
@@ -1804,34 +1373,30 @@ function startInteractiveCLI() {
       
       case 'unity-editor':
       case 'unity-game':
-        if (!args) {
+        if (!commandArgs) {
           console.log(`\n  ❌ Usage: ${command} <tool> [key=value ...]`);
-          console.log(`  Example: ${command} play`);
-          console.log(`  Example: ${command} execute script="return 2+2"`);
         } else {
           const server = command === 'unity-editor' ? 'editor' : 'game';
-          const argParts = args.split(' ');
+          const argParts = commandArgs.split(' ');
           const tool = argParts[0];
           const toolArgs = {};
           
-          // Parse key=value arguments
           for (let i = 1; i < argParts.length; i++) {
             const match = argParts[i].match(/^(\w+)=(.+)$/);
             if (match) {
-              const [, key, value] = match;
-              // Remove quotes if present
-              toolArgs[key] = value.replace(/^["']|["']$/g, '');
+              toolArgs[match[1]] = match[2].replace(/^["']|["']$/g, '');
             }
           }
           
           console.log(`\n  🎮 Calling ${server} tool: ${tool}`);
-          await callUnityMCP(server, tool, toolArgs);
+          const result = await callUnityMCPForTool(server, tool, toolArgs);
+          console.log(`  ${result}`);
         }
         break;
       
       case 'unity-tools':
         console.log('\n  🔧 Fetching Unity MCP tools...\n');
-        await listUnityTools();
+        console.log(await listUnityToolsFormatted());
         break;
 
       case 'exit':
@@ -1841,7 +1406,7 @@ function startInteractiveCLI() {
         break;
 
       default:
-        console.log(`\n  ❌ Unknown command: ${command}. Type "help" for available commands.`);
+        console.log(`\n  ❌ Unknown command: ${command}. Type "help" for commands.`);
         break;
     }
 
@@ -1854,21 +1419,54 @@ function startInteractiveCLI() {
   });
 }
 
-  console.log(`
-  ╔══════════════════════════════════════════════╗
-  ║     █████╗ ██╗██████╗  ██████╗ ███╗   ██╗    ║
-  ║    ██╔══██╗██║██╔══██╗██╔═══██╗████╗  ██║    ║
-  ║    ███████║██║██████╔╝██║   ██║██╔██╗ ██║    ║
-  ║    ██╔══██║██║██╔══██╗██║   ██║██║╚██╗██║    ║
-  ║    ██║  ██║██║██║  ██║╚██████╔╝██║ ╚████║    ║
-  ║    ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝    ║
-  ║                                              ║
-  ║              AI Remote Operations Node       ║
-  ╚══════════════════════════════════════════════╝
-  `);
+// ============================================================
+// Main Entry Point
+// ============================================================
 
-  console.log('  🔗 Connecting to relay...');
-  connect(token);
+async function main() {
+  console.log(`
+╔══════════════════════════════════════════════╗
+║     █████╗ ██╗██████╗  ██████╗ ███╗   ██╗    ║
+║    ██╔══██╗██║██╔══██╗██╔═══██╗████╗  ██║    ║
+║    ███████║██║██████╔╝██║   ██║██╔██╗ ██║    ║
+║    ██╔══██║██║██╔══██╗██║   ██║██║╚██╗██║    ║
+║    ██║  ██║██║██║  ██║╚██████╔╝██║ ╚████║    ║
+║    ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝    ║
+║                                              ║
+║           AI Remote Operations Node          ║
+╚══════════════════════════════════════════════╝
+  `);
+  
+  console.log(`  🔗 Relay: ${RELAY_URL}`);
+  console.log(`  🔐 OIDC Issuer: ${OIDC_ISSUER}`);
+  console.log(`  🎮 Unity Editor Port: ${UNITY_EDITOR_PORT}`);
+  console.log(`  🎮 Unity Game Port: ${UNITY_GAME_PORT}`);
+  console.log(`  📁 Working directory: ${WORKING_DIR}`);
+  
+  // Authenticate
+  try {
+    currentIdToken = await authenticate();
+  } catch (err) {
+    console.error(`\n  ❌ Authentication failed: ${err.message}\n`);
+    process.exit(1);
+  }
+  
+  // Connect with auto-reconnect
+  while (true) {
+    try {
+      await connectToRelay();
+    } catch (err) {
+      console.error(`  ❌ Connection error: ${err.message}`);
+    }
+    
+    console.log('  ⏳ Reconnecting in 3 seconds...');
+    await new Promise(r => setTimeout(r, 3000));
+    
+    // Refresh token before reconnecting
+    try {
+      await refreshTokenIfNeeded();
+    } catch {}
+  }
 }
 
 main().catch(err => {
